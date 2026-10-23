@@ -364,6 +364,92 @@ function expBlock(id) {
   return '<div class="exp md"><div class="label">From my experience</div>' + md(EXP[id]) + '</div>';
 }
 
+/* ---------- Search ----------
+   Results come in two groups: every query word is in the question title,
+   or the words are found only in the answers. Russian terms are mapped to
+   English ones, and text typed in the wrong keyboard layout is fixed. */
+const RU_TERMS = {
+  'замыкан': 'closure', 'промис': 'promise', 'асинхрон': 'async', 'всплыт': 'bubbling', 'погружен': 'capturing',
+  'делегир': 'delegation', 'прототип': 'prototyp', 'наследов': 'inherit', 'контекст': 'context', 'цикл': 'loop',
+  'событ': 'event', 'микрозадач': 'microtask', 'макрозадач': 'macrotask', 'генератор': 'generator', 'каррир': 'curry',
+  'рекурс': 'recursion', 'регуляр': 'regular expression', 'сборщик': 'garbage', 'мусор': 'garbage', 'утечк': 'leak',
+  'копирова': 'copy', 'глубок': 'deep', 'стрелоч': 'arrow', 'деструкт': 'destructur', 'спред': 'spread',
+  'полифил': 'polyfill', 'класс': 'class', 'функци': 'function', 'объект': 'object', 'массив': 'array',
+  'тип': 'type', 'дженерик': 'generic', 'интерфейс': 'interface', 'хук': 'hook', 'состоян': 'state',
+  'пропс': 'props', 'ключ': 'key', 'рендер': 'render', 'реконсил': 'reconciliation', 'виртуал': 'virtual',
+  'мемоиз': 'memo', 'контролир': 'controlled', 'редакс': 'redux', 'стейт': 'state', 'реактивн': 'reactiv',
+  'вычисля': 'computed', 'слот': 'slot', 'директив': 'directive', 'жизнен': 'lifecycle', 'модификатор': 'modifier',
+  'роутинг': 'rout', 'маршрут': 'rout', 'гидратац': 'hydration', 'серверн': 'server', 'кэш': 'cach', 'кеш': 'cach',
+  'производител': 'performance', 'оптимиз': 'optimiz', 'бандл': 'bundle', 'картинк': 'image', 'изображен': 'image',
+  'шрифт': 'font', 'ленив': 'lazy', 'дебаунс': 'debounce', 'троттл': 'throttle', 'воркер': 'worker',
+  'безопасн': 'security', 'куки': 'cookie', 'хранилищ': 'storage', 'токен': 'token', 'авториз': 'auth',
+  'доступност': 'accessib', 'фокус': 'focus', 'тест': 'test', 'мок': 'mock', 'специфичн': 'specificity',
+  'позиционир': 'position', 'центрир': 'center', 'анимац': 'animation', 'флекс': 'flex', 'грид': 'grid',
+  'селектор': 'selector', 'псевдо': 'pseudo', 'препроцессор': 'preprocessor', 'миксин': 'mixin', 'семантик': 'semantic',
+  'адаптив': 'responsive', 'медиа': 'media', 'тень': 'shadow', 'запрос': 'request', 'метод': 'method',
+  'сокет': 'websocket', 'гит': 'git', 'ребейз': 'rebase', 'мерж': 'merge', 'ветк': 'branch', 'коммит': 'commit',
+  'паттерн': 'pattern', 'ооп': 'oop', 'солид': 'solid', 'архитектур': 'architecture', 'микрофронт': 'micro-frontend',
+  'дизайн': 'design', 'структур': 'structure', 'монорепо': 'monorepo', 'линтер': 'lint', 'бандлер': 'bundler',
+  'ревью': 'review', 'ментор': 'mentor', 'оценк': 'estimat', 'дедлайн': 'deadline', 'техдолг': 'technical debt',
+  'долг': 'debt', 'несоглас': 'disagree', 'конфликт': 'disagree', 'проект': 'project', 'ошибк': 'error',
+  'обработк': 'handl', 'отмен': 'cancel', 'наблюдат': 'observer', 'интернационал': 'i18n', 'перевод': 'i18n',
+};
+const RU_LAYOUT = 'йцукенгшщзхъфывапролджэячсмитьбю.ё';
+const EN_LAYOUT = "qwertyuiop[]asdfghjkl;'zxcvbnm,./`";
+function fixLayout(word) { return [...word].map(ch => { const i = RU_LAYOUT.indexOf(ch); return i >= 0 ? EN_LAYOUT[i] : ch; }).join(''); }
+function wordVariants(word) {
+  const out = new Set([word]);
+  if (/[а-яё]/.test(word)) {
+    for (const [stem, en] of Object.entries(RU_TERMS)) {
+      if (word.startsWith(stem) || (word.length >= 4 && stem.startsWith(word))) en.split(' ').forEach(w => out.add(w));
+    }
+    if (word.length >= 3) out.add(fixLayout(word));
+  }
+  return [...out];
+}
+const plain = s => s.replace(/`/g, '').toLowerCase();
+let searchIndex = null;
+function buildIndex() {
+  searchIndex = QS.map(q => ({ q, title: plain(q.q), short: plain(q.s), rest: plain(q.d + ' ' + (EXP[q.id] || '')) }));
+}
+// Returns { title: [...], body: [...], words } — words are the variant lists, for highlighting.
+function search(text, filter = () => true) {
+  if (!searchIndex) buildIndex();
+  const words = text.toLowerCase().split(/[\s,]+/).filter(Boolean).map(wordVariants);
+  if (!words.length) return { title: [], body: [], words };
+  const has = (hay, vs) => vs.some(v => hay.includes(v));
+  const title = [], body = [];
+  for (const e of searchIndex) {
+    if (!filter(e.q)) continue;
+    const inTitle = words.map(vs => has(e.title, vs));
+    if (inTitle.every(Boolean)) {
+      // whole-word and early matches rank higher
+      let score = 0;
+      words.forEach(vs => vs.forEach(v => {
+        const i = e.title.indexOf(v);
+        if (i < 0) return;
+        score += 10 - Math.min(9, Math.floor(i / 12));
+        if (new RegExp('\\b' + v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b').test(e.title)) score += 5;
+      }));
+      title.push({ q: e.q, score });
+    } else if (words.every((vs, k) => inTitle[k] || has(e.short, vs) || has(e.rest, vs))) {
+      let score = inTitle.filter(Boolean).length * 20;
+      words.forEach(vs => { if (has(e.short, vs)) score += 5; });
+      body.push({ q: e.q, score });
+    }
+  }
+  const by = (a, b) => b.score - a.score;
+  return { title: title.sort(by).map(r => r.q), body: body.sort(by).map(r => r.q), words };
+}
+// Wraps matches in <mark>, touching only text outside of HTML tags.
+function markMatches(html, words) {
+  const vs = [...new Set(words.flat())].filter(v => v.length > 1).sort((a, b) => b.length - a.length);
+  if (!vs.length) return html;
+  const re = new RegExp('(' + vs.map(v => esc(v).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|') + ')', 'gi');
+  return html.split(/(<[^>]+>)/).map(part => part.startsWith('<') ? part : part.replace(re, '<mark>$1</mark>')).join('');
+}
+const divider = (label, n) => '<div class="divider"><span>' + label + ' · ' + n + '</span></div>';
+
 /* ---------- Icons ---------- */
 const ICON_STAR = '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 2.8l2.8 5.8 6.3.9-4.6 4.4 1.1 6.3L12 17.3l-5.6 2.9 1.1-6.3L2.9 9.5l6.3-.9z"/></svg>';
 const ICON_STAR_O = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true"><path d="M12 2.8l2.8 5.8 6.3.9-4.6 4.4 1.1 6.3L12 17.3l-5.6 2.9 1.1-6.3L2.9 9.5l6.3-.9z"/></svg>';
@@ -444,11 +530,6 @@ function nextCard() {
 }
 
 let catFilter = 'all', statusFilter = 'all', query = '';
-function matches(q, words) {
-  if (!words.length) return true;
-  const hay = (q.q + ' ' + q.s + ' ' + q.d + ' ' + (EXP[q.id] || '')).toLowerCase();
-  return words.every(w => hay.includes(w));
-}
 function renderCatalog() {
   const chips = [['all', 'Все', QS.length]].concat(DATA.cats.map(c => [c.id, c.name, CAT_COUNT[c.id]]));
   const statuses = [['all', 'Все'], ['new', 'Новые'], ['weak', 'Не знаю'], ['learning', 'Учу'], ['learned', 'Выучено'], ['fav', '★ Избранное'], ['exp', '💼 С опытом']];
@@ -466,21 +547,73 @@ function statusMatches(q) {
   if (statusFilter === 'exp') return !!EXP[q.id];
   return status(q.id) === statusFilter;
 }
+function catalogItem(q, words) {
+  const st = status(q.id);
+  const title = words ? markMatches(inline(q.q), words) : inline(q.q);
+  return '<a class="item" href="#/q/' + q.id + '"><span class="dot ' + st + '" aria-hidden="true"></span><span class="t">' + title +
+    '<span class="c"><span>' + STATUS_LABEL[st] + '</span>' + (words ? '<span>' + esc(CAT_NAME[q.cat]) + '</span>' : '') +
+    (q.x ? '<span>Senior+</span>' : '') + (EXP[q.id] ? '<span>💼 опыт</span>' : '') + (S.fav[q.id] ? '<span>★</span>' : '') + '</span></span></a>';
+}
 function renderResults() {
-  const words = query.toLowerCase().split(/\s+/).filter(Boolean);
-  const list = QS.filter(q => (catFilter === 'all' || q.cat === catFilter) && statusMatches(q) && matches(q, words));
-  let h = '<div class="count-line">' + list.length + ' ' + plural(list.length, 'вопрос', 'вопроса', 'вопросов') + '</div>';
-  let lastCat = null;
-  h += '<div class="list">';
-  for (const q of list) {
-    if (catFilter === 'all' && q.cat !== lastCat) { h += '<div class="group-title">' + esc(CAT_NAME[q.cat]) + '</div>'; lastCat = q.cat; }
-    const st = status(q.id);
-    h += '<a class="item" href="#/q/' + q.id + '"><span class="dot ' + st + '" aria-hidden="true"></span><span class="t">' + inline(q.q) +
-      '<span class="c"><span>' + STATUS_LABEL[st] + '</span>' + (q.x ? '<span>Senior+</span>' : '') + (EXP[q.id] ? '<span>💼 опыт</span>' : '') + (S.fav[q.id] ? '<span>★</span>' : '') + '</span></span></a>';
+  const filter = q => (catFilter === 'all' || q.cat === catFilter) && statusMatches(q);
+  const countLine = n => '<div class="count-line">' + n + ' ' + plural(n, 'вопрос', 'вопроса', 'вопросов') + '</div>';
+  let h;
+  if (query.trim()) {
+    // Searching: title matches first, then a divider and matches found only in answers.
+    const r = search(query, filter);
+    h = countLine(r.title.length + r.body.length) + '<div class="list">' + r.title.map(q => catalogItem(q, r.words)).join('');
+    if (r.body.length) h += divider('Найдено в ответах', r.body.length) + r.body.map(q => catalogItem(q, r.words)).join('');
+    h += '</div>';
+    if (!r.title.length && !r.body.length) h += '<div class="empty"><p>Ничего не найдено.</p></div>';
+  } else {
+    const list = QS.filter(filter);
+    let lastCat = null;
+    h = countLine(list.length) + '<div class="list">';
+    for (const q of list) {
+      if (catFilter === 'all' && q.cat !== lastCat) { h += '<div class="group-title">' + esc(CAT_NAME[q.cat]) + '</div>'; lastCat = q.cat; }
+      h += catalogItem(q);
+    }
+    h += '</div>';
+    if (!list.length) h += '<div class="empty"><p>Ничего не найдено.</p></div>';
   }
-  h += '</div>';
-  if (!list.length) h += '<div class="empty"><p>Ничего не найдено.</p></div>';
   $('#results').innerHTML = h;
+}
+
+/* ---------- Interview: quick lookup ---------- */
+let iQuery = '', iOpen = null, iDetails = false;
+function interviewItem(q, words) {
+  const open = iOpen === q.id;
+  let h = '<div class="qa' + (open ? ' open' : '') + '"><button class="qa-head" data-peek="' + q.id + '" aria-expanded="' + open + '">' +
+    '<span class="t">' + markMatches(inline(q.q), words) + '</span><span class="qa-cat">' + esc(CAT_NAME[q.cat]) + (EXP[q.id] ? ' · 💼' : '') + '</span></button>';
+  if (open) {
+    h += '<div class="qa-body"><div class="short md"><div class="label">Short answer</div>' + markMatches(md(q.s), words) + '</div>' +
+      (EXP[q.id] && S.settings.exp ? '<div class="exp md"><div class="label">From my experience</div>' + markMatches(md(EXP[q.id]), words) + '</div>' : '') +
+      '<button class="details-toggle" data-act="peek-details" aria-expanded="' + iDetails + '">' + (iDetails ? 'Скрыть подробности ▴' : 'Подробный ответ ▾') + '</button>' +
+      (iDetails ? '<div class="details md">' + markMatches(md(q.d), words) + '</div>' : '') + '</div>';
+  }
+  return h + '</div>';
+}
+function renderInterview() {
+  view.innerHTML =
+    '<div class="isearch-wrap"><label class="visually-hidden" for="isearch">Быстрый поиск</label>' +
+    '<input id="isearch" class="search big" type="search" enterkeyhint="search" placeholder="Что спросили? closure, замыкание, event loop…" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" value="' + esc(iQuery) + '">' +
+    '<button class="clear" data-act="iclear" aria-label="Очистить">✕</button></div>' +
+    '<div id="iresults"></div>';
+  renderInterviewResults();
+}
+function renderInterviewResults() {
+  const box = $('#iresults');
+  if (!box) return;
+  if (!iQuery.trim()) {
+    box.innerHTML = '<div class="empty ihint"><p>Набери слово из вопроса — по-английски, по-русски или в неправильной раскладке. Нажми на вопрос, чтобы раскрыть ответ прямо здесь.</p></div>';
+    return;
+  }
+  const r = search(iQuery);
+  let h = '<div class="list">' + r.title.map(q => interviewItem(q, r.words)).join('');
+  if (r.body.length) h += divider('Найдено в ответах', r.body.length) + r.body.map(q => interviewItem(q, r.words)).join('');
+  h += '</div>';
+  if (!r.title.length && !r.body.length) h = '<div class="empty"><p>Ничего не найдено.</p></div>';
+  box.innerHTML = h;
 }
 
 function renderDetail(id) {
@@ -638,7 +771,8 @@ function route() {
   document.querySelectorAll('nav.tabs a').forEach(a => {
     if (a.dataset.tab === tab) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current');
   });
-  if (name === 'catalog') renderCatalog();
+  if (name === 'interview') { renderInterview(); if (!iQuery) $('#isearch').focus({ preventScroll: true }); }
+  else if (name === 'catalog') renderCatalog();
   else if (name === 'q') renderDetail(arg);
   else if (name === 'progress') renderProgress();
   else if (name === 'settings') renderSettings();
@@ -666,6 +800,16 @@ document.addEventListener('click', async e => {
   if (d.mode) { S.settings.mode = d.mode; saveSettings(); current = null; lastShown = []; renderStudy(); return; }
   if (d.open === 'cats') { openCats(); return; }
   if (d.cat) { catFilter = d.cat; renderCatalog(); return; }
+  if (d.peek) {
+    iOpen = iOpen === d.peek ? null : d.peek; iDetails = false;
+    if (document.activeElement && document.activeElement.id === 'isearch') document.activeElement.blur(); // hide the iOS keyboard
+    renderInterviewResults();
+    const el = iOpen && document.querySelector('[data-peek="' + iOpen + '"]');
+    if (el) el.scrollIntoView({ block: 'start' });
+    return;
+  }
+  if (d.act === 'peek-details') { iDetails = !iDetails; renderInterviewResults(); return; }
+  if (d.act === 'iclear') { iQuery = ''; iOpen = null; const f = $('#isearch'); f.value = ''; renderInterviewResults(); f.focus(); return; }
   if (d.status) { statusFilter = d.status; renderCatalog(); return; }
   if (d.study) { forcedNext = d.study; current = null; location.hash = '#/study'; return; }
   if (d.act === 'back') { if (history.length > 1) history.back(); else location.hash = '#/catalog'; return; }
@@ -729,6 +873,7 @@ document.addEventListener('change', async e => {
 });
 document.addEventListener('input', e => {
   if (e.target.id === 'search') { query = e.target.value; renderResults(); }
+  if (e.target.id === 'isearch') { iQuery = e.target.value; iOpen = null; renderInterviewResults(); }
 });
 document.addEventListener('keydown', e => {
   if (!current || (location.hash || '#/study') !== '#/study' || e.target.closest('input, textarea') || document.querySelector('.overlay')) return;
