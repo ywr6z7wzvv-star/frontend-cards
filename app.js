@@ -13,6 +13,9 @@ const MIN = 60e3, HOUR = 60 * MIN, DAY = 24 * HOUR;
 // Leitner boxes: 0 = new/forgotten, 1..5 = increasing intervals
 const INTERVALS = [MIN, 15 * MIN, DAY, 3 * DAY, 7 * DAY, 16 * DAY];
 const LEARNED_BOX = 3;
+// "Слабые": any card ever answered "Не знал" or "Сомневался" stays weak
+// until it gets this many "Знал" in a row; a mistake resets the streak.
+const WEAK_EXIT_STREAK = 3;
 const LEGACY_LS_KEY = 'fe-cards.v1';   // progress format of the original single-file version
 
 function defaults() {
@@ -30,7 +33,7 @@ let reviewsCount = 0;
 
 /* ---------- Storage: IndexedDB ----------
    Database "fe-cards":
-     cards   – key: question id, value: { box, due, seen, ok, fail, last }
+     cards   – key: question id, value: { box, due, seen, ok, fail, doubt, okStreak, last }
      kv      – keys: 'fav', 'days', 'settings', 'tickets', 'run'
      reviews – auto-increment log of every answer: { id, grade, box, ts }
    If IndexedDB is unavailable, everything falls back to one localStorage key. */
@@ -81,6 +84,7 @@ const idb = {
     });
   },
   putKV(key, value) { return this.write(['kv'], tx => tx.objectStore('kv').put(value, key)); },
+  putCards(cards) { return this.write(['cards'], tx => Object.entries(cards).forEach(([id, c]) => tx.objectStore('cards').put(c, id))); },
   reviews() { return reqP(this.db.transaction('reviews').objectStore('reviews').getAll()); },
   replace(state, reviews) {
     return this.write(['cards', 'kv', 'reviews'], tx => {
@@ -104,6 +108,7 @@ const ls = {
   dump() { localStorage.setItem(LEGACY_LS_KEY, JSON.stringify(S)); return Promise.resolve(); },
   answer() { return this.dump(); },
   putKV() { return this.dump(); },
+  putCards() { return this.dump(); },
   reviews() { return Promise.resolve([]); },
   replace() { return this.dump(); },
 };
@@ -143,6 +148,7 @@ async function initStorage() {
   }
   S = mergeState(loaded);
   reviewsCount = loaded.reviewsCount || 0;
+  await backfillStreaks();
 
   // Ask the browser not to evict our data under storage pressure.
   try {
@@ -151,6 +157,30 @@ async function initStorage() {
       if (!persisted) persisted = await navigator.storage.persist();
     }
   } catch (err) { /* not supported */ }
+}
+
+// Cards saved before okStreak/doubt existed: rebuild both from the review log.
+async function backfillStreaks() {
+  const old = Object.keys(S.cards).filter(id => S.cards[id].okStreak === undefined);
+  if (!old.length) return;
+  let reviews = [];
+  try { reviews = await backend.reviews(); } catch (err) { /* no log: approximate below */ }
+  const byId = {};
+  reviews.forEach(r => { (byId[r.id] = byId[r.id] || []).push(r); });
+  const changed = {};
+  old.forEach(id => {
+    const c = S.cards[id], log = (byId[id] || []).sort((a, b) => a.ts - b.ts);
+    if (log.length) {
+      c.doubt = log.filter(r => r.grade === 1).length;
+      c.okStreak = 0;
+      log.forEach(r => { c.okStreak = r.grade === 2 ? c.okStreak + 1 : 0; });
+    } else {
+      c.doubt = c.doubt || 0;
+      c.okStreak = c.box === 0 ? 0 : c.fail ? 0 : c.ok;
+    }
+    changed[id] = c;
+  });
+  await persist(backend.putCards(changed));
 }
 
 function mergeState(s) {
@@ -215,8 +245,9 @@ function nextState(id, grade) {
   const now = Date.now();
   const c = { box: 0, due: now, seen: 0, ok: 0, fail: 0, ...(card(id) || {}) };
   if (grade === 0) { c.box = 0; c.fail++; }
-  else if (grade === 1) c.box = c.box > 2 ? c.box - 1 : Math.max(1, c.box);
+  else if (grade === 1) { c.box = c.box > 2 ? c.box - 1 : Math.max(1, c.box); c.doubt = (c.doubt || 0) + 1; }
   else { c.box = Math.min(5, c.box + 1); c.ok++; }
+  c.okStreak = grade === 2 ? (c.okStreak || 0) + 1 : 0;
   const iv = grade === 1 ? Math.max(5 * MIN, Math.min(INTERVALS[c.box] / 2, DAY)) : INTERVALS[c.box];
   c.due = now + iv; c.seen++; c.last = now;
   return { c, iv };
@@ -231,12 +262,16 @@ function grade(id, g) {
   updatePill();
 }
 
+function isWeak(id) {
+  const c = card(id);
+  return !!c && (c.fail + (c.doubt || 0)) > 0 && (c.okStreak || 0) < WEAK_EXIT_STREAK;
+}
 function pool() {
   const cats = new Set(S.settings.cats);
   let list = QS.filter(q => cats.has(q.cat));
   if (S.settings.onlyExp) list = list.filter(q => EXP[q.id]);
   const mode = S.settings.mode;
-  if (mode === 'weak') list = list.filter(q => { const c = card(q.id); return c && (c.box <= 1 || c.fail > c.ok); });
+  if (mode === 'weak') list = list.filter(q => isWeak(q.id));
   if (mode === 'fav') list = list.filter(q => S.fav[q.id]);
   return list;
 }
@@ -528,7 +563,7 @@ function renderStudy() {
     '<span>' + today + ' / ' + goal + '</span><div class="goalbar" title="Цель на день"><div style="width:' + Math.min(100, today / goal * 100) + '%"></div></div><span>' + pool().length + ' в колоде</span></div>';
   if (!current) {
     const msg = S.settings.mode === 'fav' ? ['Избранное пусто', 'Отмечай сложные вопросы звёздочкой, чтобы гонять их отдельно.']
-      : S.settings.mode === 'weak' ? ['Слабых карточек нет', 'Сюда попадают вопросы, на которые ты ответил «Не знал». Отличная работа!']
+      : S.settings.mode === 'weak' ? ['Слабых карточек нет', 'Сюда попадают вопросы, где ты ответил «Не знал» или «Сомневался». Вопрос уходит отсюда после ' + WEAK_EXIT_STREAK + ' «Знал» подряд.']
       : ['Колода пуста', 'Выбери хотя бы одну тему.'];
     view.innerHTML = h + '<div class="card empty"><h2>' + msg[0] + '</h2><p>' + msg[1] + '</p></div>';
     return;
@@ -835,7 +870,7 @@ function renderSettings() {
     '<div class="setting"><div class="l">Сразу показывать подробный ответ<small>Иначе сначала только short answer</small></div><button class="switch" role="switch" data-toggle="details" aria-checked="' + S.settings.details + '" aria-label="Подробный ответ"></button></div>' +
     '<div class="setting"><div class="l">Показывать истории из опыта<small>Блок «From my experience» под ответом</small></div><button class="switch" role="switch" data-toggle="exp" aria-checked="' + S.settings.exp + '" aria-label="Истории из опыта"></button></div>' +
     '</div>' +
-    '<div class="section-title">Как это работает</div><div class="card md"><p>Каждая карточка живёт в одной из 5 «коробок». <strong>Знал</strong> переносит её выше, и она возвращается всё реже: через 15 минут, день, 3, 7 и 16 дней. <strong>Сомневался</strong> откладывает ненадолго. <strong>Не знал</strong> отправляет в начало, и карточка вернётся через минуту.</p><p>Режим <strong>Умный</strong> сначала даёт карточки, которые пора повторить, потом новые. <strong>Слабые</strong> гоняет только то, что ты не знал. Карточка считается выученной с 3-й коробки.</p></div>' +
+    '<div class="section-title">Как это работает</div><div class="card md"><p>Каждая карточка живёт в одной из 5 «коробок». <strong>Знал</strong> переносит её выше, и она возвращается всё реже: через 15 минут, день, 3, 7 и 16 дней. <strong>Сомневался</strong> откладывает ненадолго. <strong>Не знал</strong> отправляет в начало, и карточка вернётся через минуту.</p><p>Режим <strong>Умный</strong> сначала даёт карточки, которые пора повторить, потом новые. <strong>Слабые</strong> гоняет вопросы, где ты хоть раз ответил «Не знал» или «Сомневался»; вопрос уходит оттуда только после 3 «Знал» подряд. Карточка считается выученной с 3-й коробки.</p></div>' +
     '<div class="section-title">Хранилище</div><div class="card"><p class="count-line">' +
     (backend === idb ? 'IndexedDB' : 'localStorage (IndexedDB недоступна)') + ' · ' +
     Object.keys(S.cards).length + ' ' + plural(Object.keys(S.cards).length, 'карточка', 'карточки', 'карточек') + ' с прогрессом · ' +
@@ -864,6 +899,7 @@ async function applyBackup(text) {
   const reviews = Array.isArray(obj.reviews) ? obj.reviews : [];
   await backend.replace(S, reviews);
   reviewsCount = reviews.length;
+  await backfillStreaks();
 }
 
 /* ---------- Sheets ---------- */
