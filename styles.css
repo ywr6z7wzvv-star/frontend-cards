@@ -269,3 +269,39 @@ mark { background: rgba(240,180,41,.28); color: inherit; border-radius: 3px; pad
 .qa-cat { font-size: 12px; color: var(--faint); font-weight: 500; }
 .qa-body { padding: 0 14px 14px; }
 .qa-body .short { margin-top: 0; }
+
+/* Tickets */
+.seg.full.two { grid-template-columns: 1fr 1fr; }
+.tk-continue { margin-bottom: 10px; }
+.tk-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+.tk-actions .btn { flex: 1 1 auto; justify-content: center; }
+.btn:disabled { opacity: .45; cursor: default; }
+.tk-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(72px, 1fr)); gap: 8px; margin-top: 10px; }
+.tk {
+  border: 1px solid var(--border); background: var(--surface); border-radius: 12px; padding: 10px 4px 8px;
+  display: flex; flex-direction: column; align-items: center; gap: 2px;
+}
+.tk b { font-size: 22px; line-height: 1.1; }
+.tk small { font-size: 11.5px; color: var(--muted); font-weight: 600; white-space: nowrap; }
+.tk.passed { background: var(--good-soft); border-color: transparent; }
+.tk.passed b, .tk.passed small { color: var(--good); }
+.tk.failed { background: var(--bad-soft); border-color: transparent; }
+.tk.failed b, .tk.failed small { color: var(--bad); }
+.tk.progress { border-color: var(--warn); }
+.tk.progress small { color: var(--warn); }
+.tk-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; font-size: 14px; font-weight: 700; color: var(--muted); }
+.tk-head .back { margin: 0; }
+.tk-dots { display: flex; gap: 3px; margin-bottom: 12px; }
+.tk-dots i { flex: 1; height: 6px; border-radius: 99px; background: var(--surface-2); }
+.tk-dots i.now { background: var(--accent); }
+.tk-dots i.good { background: var(--good); }
+.tk-dots i.warn { background: var(--warn); }
+.tk-dots i.bad { background: var(--bad); }
+.tk-result { text-align: center; }
+.tk-result .tk-dots { margin: 12px 0 0; }
+.tk-result-title { font-size: 18px; font-weight: 800; }
+.tk-result.passed .tk-result-title { color: var(--good); }
+.tk-result.failed .tk-result-title { color: var(--bad); }
+.tk-score { font-size: 15px; color: var(--muted); margin: 6px 0 2px; }
+.tk-score b { font-size: 40px; color: var(--text); }
+.tk-after { margin-top: 16px; }

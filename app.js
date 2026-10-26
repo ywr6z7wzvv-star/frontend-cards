@@ -20,7 +20,9 @@ function defaults() {
     cards: {},
     fav: {},
     days: {},
-    settings: { theme: 'auto', details: false, exp: true, onlyExp: false, goal: 20, mode: 'smart', cats: null },
+    tickets: {},    // ticket number -> { attempts, best, last, passed, ts }
+    run: null,      // ticket in progress: { key, ids, i, answers }
+    settings: { theme: 'auto', details: false, exp: true, onlyExp: false, goal: 20, mode: 'smart', cats: null, view: 'cards' },
   };
 }
 let S = defaults();
@@ -29,7 +31,7 @@ let reviewsCount = 0;
 /* ---------- Storage: IndexedDB ----------
    Database "fe-cards":
      cards   – key: question id, value: { box, due, seen, ok, fail, last }
-     kv      – keys: 'fav', 'days', 'settings'
+     kv      – keys: 'fav', 'days', 'settings', 'tickets', 'run'
      reviews – auto-increment log of every answer: { id, grade, box, ts }
    If IndexedDB is unavailable, everything falls back to one localStorage key. */
 const DB_NAME = 'fe-cards', DB_VERSION = 1;
@@ -56,14 +58,15 @@ const idb = {
   async load() {
     const tx = this.db.transaction(['cards', 'kv', 'reviews'], 'readonly');
     const cs = tx.objectStore('cards'), kv = tx.objectStore('kv');
-    const [keys, vals, fav, days, settings, count] = await Promise.all([
+    const [keys, vals, fav, days, settings, tickets, run, count] = await Promise.all([
       reqP(cs.getAllKeys()), reqP(cs.getAll()),
       reqP(kv.get('fav')), reqP(kv.get('days')), reqP(kv.get('settings')),
+      reqP(kv.get('tickets')), reqP(kv.get('run')),
       reqP(tx.objectStore('reviews').count()),
     ]);
     const cards = {};
     keys.forEach((k, i) => { cards[k] = vals[i]; });
-    return { cards, fav, days, settings, reviewsCount: count, empty: !settings && !keys.length };
+    return { cards, fav, days, settings, tickets, run, reviewsCount: count, empty: !settings && !keys.length };
   },
   write(stores, fn) {
     const tx = this.db.transaction(stores, 'readwrite');
@@ -85,6 +88,7 @@ const idb = {
       cs.clear(); rs.clear();
       Object.entries(state.cards).forEach(([id, c]) => cs.put(c, id));
       kv.put(state.fav, 'fav'); kv.put(state.days, 'days'); kv.put(state.settings, 'settings');
+      kv.put(state.tickets || {}, 'tickets'); kv.put(state.run || null, 'run');
       (reviews || []).forEach(r => rs.add(r));
     });
   },
@@ -95,7 +99,7 @@ const ls = {
   load() {
     const raw = localStorage.getItem(LEGACY_LS_KEY);
     const s = raw ? JSON.parse(raw) : {};
-    return { cards: s.cards || {}, fav: s.fav, days: s.days, settings: s.settings, reviewsCount: 0, empty: !raw };
+    return { cards: s.cards || {}, fav: s.fav, days: s.days, settings: s.settings, tickets: s.tickets, run: s.run, reviewsCount: 0, empty: !raw };
   },
   dump() { localStorage.setItem(LEGACY_LS_KEY, JSON.stringify(S)); return Promise.resolve(); },
   answer() { return this.dump(); },
@@ -154,10 +158,12 @@ function mergeState(s) {
   const settings = { ...d.settings, ...(s.settings || {}) };
   const allCats = DATA.cats.map(c => c.id);
   settings.cats = Array.isArray(settings.cats) ? settings.cats.filter(c => allCats.includes(c)) : allCats;
-  return { cards: s.cards || {}, fav: s.fav || {}, days: s.days || {}, settings };
+  return { cards: s.cards || {}, fav: s.fav || {}, days: s.days || {}, tickets: s.tickets || {}, run: s.run || null, settings };
 }
 const saveSettings = () => persist(backend.putKV('settings', S.settings));
 const saveFav = () => persist(backend.putKV('fav', S.fav));
+const saveTickets = () => persist(backend.putKV('tickets', S.tickets));
+const saveRun = () => persist(backend.putKV('run', S.run));
 
 /* ---------- Helpers ---------- */
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -479,7 +485,36 @@ let forcedNext = null;
 let detailsOpen = false;
 let animateNext = true;
 
+const VIEW_SWITCH = () => '<div class="toolbar"><div class="seg full two" role="group" aria-label="Формат">' +
+  [['cards', 'Карточки'], ['tickets', 'Билеты']].map(([v, l]) => '<button data-view="' + v + '" aria-pressed="' + (S.settings.view === v) + '">' + l + '</button>').join('') + '</div></div>';
+
+// Question card used by both the card deck and tickets. `t` prefixes the action names for tickets.
+function questionArticle(q, t) {
+  let h = '<article class="card' + (animateNext ? ' fade-in' : '') + '">' + metaRow(q) + '<h2 class="question">' + inline(q.q) + '</h2>';
+  if (!revealed) {
+    h += '<p class="hint">Ответь вслух, как на собеседовании, а потом открой ответ и честно оцени себя.' +
+      (EXP[q.id] && S.settings.exp ? ' <strong>💼 Тут есть история из опыта</strong> — попробуй вспомнить свой пример.' : '') + '</p>' +
+      '<div class="reveal-row"><button class="btn primary" data-act="' + (t ? 'treveal' : 'reveal') + '">Показать ответ</button>' +
+      (t ? '' : '<button class="btn" data-act="skip" aria-label="Пропустить">Пропустить</button>') + '</div>';
+  } else {
+    h += '<div class="short md"><div class="label">Short answer</div>' + md(q.s) + '</div>';
+    h += expBlock(q.id);
+    h += '<button class="details-toggle" data-act="details" aria-expanded="' + detailsOpen + '">' + (detailsOpen ? 'Скрыть подробности ▴' : 'Подробный ответ ▾') + '</button>';
+    if (detailsOpen) h += '<div class="details md">' + md(q.d) + '</div>';
+  }
+  h += '</article>';
+  if (revealed) {
+    const a = t ? 'data-tgrade' : 'data-grade';
+    h += '<div class="grades" role="group" aria-label="Оценка">' +
+      '<button class="grade bad" ' + a + '="0">Не знал<small>' + fmtInterval(previewInterval(q.id, 0)) + '</small></button>' +
+      '<button class="grade warn" ' + a + '="1">Сомневался<small>' + fmtInterval(previewInterval(q.id, 1)) + '</small></button>' +
+      '<button class="grade good" ' + a + '="2">Знал<small>' + fmtInterval(previewInterval(q.id, 2)) + '</small></button></div>';
+  }
+  return h;
+}
+
 function renderStudy() {
+  if (S.settings.view === 'tickets') { renderTickets(); animateNext = false; return; }
   if (!current || !BY_ID[current] || !pool().some(q => q.id === current) && !forcedNext) {
     current = forcedNext || (pickNext() || {}).id || null;
     forcedNext = null; revealed = false; detailsOpen = S.settings.details;
@@ -487,7 +522,7 @@ function renderStudy() {
   const today = S.days[dayKey()] || 0, goal = S.settings.goal;
   const modes = [['smart', 'Умный'], ['random', 'Случайно'], ['weak', 'Слабые'], ['fav', 'Избранное']];
   const selCats = S.settings.cats.length;
-  let h = '<div class="toolbar"><div class="seg full" role="group" aria-label="Режим">' +
+  let h = VIEW_SWITCH() + '<div class="toolbar"><div class="seg full" role="group" aria-label="Режим">' +
     modes.map(([m, l]) => '<button data-mode="' + m + '" aria-pressed="' + (S.settings.mode === m) + '">' + l + '</button>').join('') + '</div></div>';
   h += '<div class="session"><button class="chip" data-open="cats">Темы: ' + (selCats === DATA.cats.length ? 'все' : selCats + ' из ' + DATA.cats.length) + (S.settings.onlyExp ? ' · 💼' : '') + ' ▾</button>' +
     '<span>' + today + ' / ' + goal + '</span><div class="goalbar" title="Цель на день"><div style="width:' + Math.min(100, today / goal * 100) + '%"></div></div><span>' + pool().length + ' в колоде</span></div>';
@@ -498,25 +533,7 @@ function renderStudy() {
     view.innerHTML = h + '<div class="card empty"><h2>' + msg[0] + '</h2><p>' + msg[1] + '</p></div>';
     return;
   }
-  const q = BY_ID[current];
-  h += '<article class="card' + (animateNext ? ' fade-in' : '') + '">' + metaRow(q) + '<h2 class="question">' + inline(q.q) + '</h2>';
-  if (!revealed) {
-    h += '<p class="hint">Ответь вслух, как на собеседовании, а потом открой ответ и честно оцени себя.' +
-      (EXP[q.id] && S.settings.exp ? ' <strong>💼 Тут есть история из опыта</strong> — попробуй вспомнить свой пример.' : '') + '</p>' +
-      '<div class="reveal-row"><button class="btn primary" data-act="reveal">Показать ответ</button><button class="btn" data-act="skip" aria-label="Пропустить">Пропустить</button></div>';
-  } else {
-    h += '<div class="short md"><div class="label">Short answer</div>' + md(q.s) + '</div>';
-    h += expBlock(q.id);
-    h += '<button class="details-toggle" data-act="details" aria-expanded="' + detailsOpen + '">' + (detailsOpen ? 'Скрыть подробности ▴' : 'Подробный ответ ▾') + '</button>';
-    if (detailsOpen) h += '<div class="details md">' + md(q.d) + '</div>';
-  }
-  h += '</article>';
-  if (revealed) {
-    h += '<div class="grades" role="group" aria-label="Оценка">' +
-      '<button class="grade bad" data-grade="0">Не знал<small>' + fmtInterval(previewInterval(current, 0)) + '</small></button>' +
-      '<button class="grade warn" data-grade="1">Сомневался<small>' + fmtInterval(previewInterval(current, 1)) + '</small></button>' +
-      '<button class="grade good" data-grade="2">Знал<small>' + fmtInterval(previewInterval(current, 2)) + '</small></button></div>';
-  }
+  h += questionArticle(BY_ID[current], false);
   view.innerHTML = h;
   animateNext = false;
 }
@@ -527,6 +544,150 @@ function nextCard() {
   revealed = false; detailsOpen = S.settings.details; animateNext = true;
   renderStudy();
   window.scrollTo(0, 0);
+}
+
+/* ---------- Tickets ----------
+   Questions are dealt into ~20-question tickets like a deck of cards, round-robin
+   through every topic, so each ticket gets a fair share of each topic. The deal is
+   deterministic: ticket 7 is always the same set while questions.json doesn't change.
+   A ticket is passed only when every answer is "Знал". */
+const TICKET_SIZE = 20;
+let TICKETS = [];           // [[question id, ...], ...]; ticket number = index + 1
+let ticketListOpen = false; // show the list even though a ticket is in progress
+function hash(str) {
+  let h = 2166136261;
+  for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return h >>> 0;
+}
+function buildTickets() {
+  const n = Math.max(1, Math.round(QS.length / TICKET_SIZE));
+  const out = Array.from({ length: n }, () => []);
+  let k = 0;
+  DATA.cats.forEach(c => QS.filter(q => q.cat === c.id).sort((a, b) => hash(a.id) - hash(b.id)).forEach(q => out[k++ % n].push(q.id)));
+  return out.map((ids, i) => ids.sort((a, b) => hash(a + '#' + i) - hash(b + '#' + i))); // mix topics inside a ticket
+}
+// Questions answered wrong in the latest attempt of any ticket.
+function ticketMistakes() {
+  const set = new Set();
+  Object.values(S.tickets).forEach(t => (t.mistakes || []).forEach(id => BY_ID[id] && set.add(id)));
+  return [...set];
+}
+function ticketLabel(key) { return key === 'errors' ? 'Работа над ошибками' : 'Билет ' + key; }
+function runActive() { return S.run && !S.run.done; }
+
+function startTicket(key, force) {
+  if (!force && runActive() && S.run.i > 0 && S.run.key !== key) {
+    confirmSheet('Бросить ' + ticketLabel(S.run.key).toLowerCase() + '?', 'Пройдено ' + S.run.i + ' из ' + S.run.ids.length + '. Ответы уже засчитаны в прогресс карточек, но билет не будет завершён.', 'Начать другой', () => startTicket(key, true));
+    return;
+  }
+  const ids = key === 'errors' ? shuffle(ticketMistakes()) : (TICKETS[key - 1] || []).filter(id => BY_ID[id]);
+  if (!ids.length) { toast(key === 'errors' ? 'Ошибок нет' : 'Билет пуст'); return; }
+  S.run = { key, ids, i: 0, answers: [] };
+  ticketListOpen = false; revealed = false; detailsOpen = S.settings.details; animateNext = true;
+  saveRun(); renderStudy(); window.scrollTo(0, 0);
+}
+function nextTicketKey(after = 0) {
+  const n = TICKETS.length;
+  for (let k = 1; k <= n; k++) { const key = (after + k - 1) % n + 1; if (!(S.tickets[key] || {}).passed) return key; }
+  return after % n + 1;
+}
+function randomTicketKey() {
+  const keys = TICKETS.map((_, i) => i + 1);
+  const fresh = keys.filter(k => !S.tickets[k]);
+  const open = keys.filter(k => !(S.tickets[k] || {}).passed);
+  const from = fresh.length ? fresh : open.length ? open : keys;
+  return from[Math.floor(Math.random() * from.length)];
+}
+function ticketAnswer(g) {
+  const run = S.run, id = run.ids[run.i];
+  grade(id, g);                       // also counts for spaced repetition and stats
+  run.answers[run.i] = g;
+  if (run.key === 'errors' && g === 2) {
+    // fixed: drop it from every ticket's mistake list
+    Object.values(S.tickets).forEach(t => { if (t.mistakes) t.mistakes = t.mistakes.filter(x => x !== id); });
+    saveTickets();
+  }
+  run.i++;
+  if (run.i >= run.ids.length) finishTicket();
+  revealed = false; detailsOpen = S.settings.details; animateNext = true;
+  saveRun(); renderStudy(); window.scrollTo(0, 0);
+}
+function finishTicket() {
+  const run = S.run;
+  run.done = true;
+  if (run.key === 'errors') return;
+  const ok = run.answers.filter(g => g === 2).length;
+  const prev = S.tickets[run.key] || { attempts: 0, best: 0, passed: false };
+  S.tickets[run.key] = {
+    attempts: prev.attempts + 1,
+    best: Math.max(prev.best, ok),
+    last: ok,
+    size: run.ids.length,
+    passed: prev.passed || ok === run.ids.length,
+    ts: Date.now(),
+    mistakes: run.ids.filter((id, i) => run.answers[i] !== 2),
+  };
+  saveTickets();
+}
+
+function renderTickets() {
+  if (runActive() && !ticketListOpen) return renderTicketRun();
+  if (S.run && S.run.done && !ticketListOpen) return renderTicketResult();
+  const passed = TICKETS.filter((_, i) => (S.tickets[i + 1] || {}).passed).length;
+  const errors = ticketMistakes().length;
+  let h = VIEW_SWITCH();
+  if (runActive()) {
+    h += '<button class="btn primary block tk-continue" data-act="tcontinue">Продолжить: ' + ticketLabel(S.run.key) + ' · ' + S.run.i + ' из ' + S.run.ids.length + '</button>';
+  }
+  h += '<div class="tk-actions"><button class="btn" data-act="tnext">Следующий билет</button><button class="btn" data-act="trandom">Случайный</button>' +
+    '<button class="btn' + (errors ? ' danger' : '') + '" data-act="terrors"' + (errors ? '' : ' disabled') + '>Работа над ошибками · ' + errors + '</button></div>';
+  h += '<p class="count-line">Сдано ' + passed + ' из ' + TICKETS.length + '. В билете ~' + TICKET_SIZE + ' вопросов из всех тем. Сдан — только если на всё ответил «Знал».</p>';
+  h += '<div class="tk-grid">' + TICKETS.map((ids, i) => {
+    const key = i + 1, t = S.tickets[key], live = runActive() && S.run.key === key;
+    let cls = 'tk', sub;
+    if (live) { cls += ' progress'; sub = S.run.i + '/' + ids.length + '…'; }
+    else if (t) { cls += t.passed ? ' passed' : ' failed'; sub = t.last + '/' + (t.size || ids.length) + (t.passed ? ' ✓' : ''); }
+    else { const fresh = ids.filter(id => !card(id)).length; sub = fresh === ids.length ? 'новый' : fresh + ' новых'; }
+    return '<button class="' + cls + '" data-ticket="' + key + '"><b>' + key + '</b><small>' + sub + '</small></button>';
+  }).join('') + '</div>';
+  view.innerHTML = h;
+}
+function runDots(run) {
+  return '<div class="tk-dots" aria-hidden="true">' + run.ids.map((_, i) => {
+    const g = run.answers[i];
+    return '<i class="' + (g === 2 ? 'good' : g === 1 ? 'warn' : g === 0 ? 'bad' : i === run.i ? 'now' : '') + '"></i>';
+  }).join('') + '</div>';
+}
+function renderTicketRun() {
+  const run = S.run, q = BY_ID[run.ids[run.i]];
+  if (!q) { run.i++; if (run.i >= run.ids.length) finishTicket(); saveRun(); return renderStudy(); }
+  view.innerHTML = VIEW_SWITCH() +
+    '<div class="tk-head"><button class="back" data-act="tlist">‹ Билеты</button><span>' + ticketLabel(run.key) + ' · ' + (run.i + 1) + ' из ' + run.ids.length + '</span></div>' +
+    runDots(run) + questionArticle(q, true);
+}
+function renderTicketResult() {
+  const run = S.run, n = run.ids.length;
+  const cnt = g => run.answers.filter(x => x === g).length;
+  const ok = cnt(2), errors = run.key === 'errors';
+  const passed = ok === n;
+  const t = S.tickets[run.key];
+  let h = VIEW_SWITCH() + '<div class="card tk-result ' + (passed ? 'passed' : 'failed') + '">' +
+    '<div class="tk-result-title">' + ticketLabel(run.key) + (errors ? ' — готово' : passed ? ' — сдан ✓' : ' — не сдан') + '</div>' +
+    '<div class="tk-score"><b>' + ok + '</b> / ' + n + '</div>' +
+    '<p class="count-line">Знал ' + ok + ' · Сомневался ' + cnt(1) + ' · Не знал ' + cnt(0) + '</p>' +
+    (t && !errors ? '<p class="count-line">Лучший результат ' + t.best + '/' + n + ' · попыток ' + t.attempts + '</p>' : '') +
+    runDots({ ...run, i: -1 }) + '</div>';
+  const wrong = run.ids.map((id, i) => [id, run.answers[i]]).filter(([, g]) => g !== 2);
+  if (wrong.length) {
+    h += '<div class="section-title">' + (errors ? 'Ещё не выучены' : 'Ошибки') + ' · ' + wrong.length + '</div><div class="list">' +
+      wrong.map(([id, g]) => '<a class="item" href="#/q/' + id + '"><span class="dot ' + (g === 0 ? 'weak' : 'learning') + '" aria-hidden="true"></span><span class="t">' + inline(BY_ID[id].q) +
+        '<span class="c"><span>' + (g === 0 ? 'Не знал' : 'Сомневался') + '</span><span>' + esc(CAT_NAME[BY_ID[id].cat]) + '</span></span></span></a>').join('') + '</div>';
+  }
+  h += '<div class="detail-actions tk-after">' +
+    (errors ? (ticketMistakes().length ? '<button class="btn primary" data-act="terrors">Ещё раз по ошибкам</button>' : '')
+      : '<button class="btn primary" data-act="tretry">Пройти ещё раз</button><button class="btn" data-act="tnext">Следующий билет</button>') +
+    '<button class="btn" data-act="tlist">Все билеты</button></div>';
+  view.innerHTML = h;
 }
 
 let catFilter = 'all', statusFilter = 'all', query = '';
@@ -690,7 +851,7 @@ function renderSettings() {
 /* ---------- Backup ---------- */
 async function backupJson() {
   const reviews = await backend.reviews().catch(() => []);
-  return JSON.stringify({ v: 2, exported: new Date().toISOString(), cards: S.cards, fav: S.fav, days: S.days, reviews });
+  return JSON.stringify({ v: 2, exported: new Date().toISOString(), cards: S.cards, fav: S.fav, days: S.days, tickets: S.tickets, reviews });
 }
 const toB64 = s => btoa(unescape(encodeURIComponent(s)));
 const fromB64 = s => decodeURIComponent(escape(atob(s)));
@@ -699,6 +860,7 @@ async function applyBackup(text) {
   const obj = JSON.parse(text.startsWith('{') ? text : fromB64(text));
   if (!obj || typeof obj !== 'object' || !obj.cards) throw new Error('bad backup');
   S.cards = obj.cards || {}; S.fav = obj.fav || {}; S.days = obj.days || {};
+  S.tickets = obj.tickets || {}; S.run = null;
   const reviews = Array.isArray(obj.reviews) ? obj.reviews : [];
   await backend.replace(S, reviews);
   reviewsCount = reviews.length;
@@ -793,7 +955,24 @@ document.addEventListener('click', async e => {
     toast(S.fav[d.fav] ? 'Добавлено в избранное' : 'Убрано из избранного');
     return;
   }
-  if (d.act === 'reveal') { revealed = true; renderStudy(); return; }
+  if (d.act === 'reveal' || d.act === 'treveal') { revealed = true; renderStudy(); return; }
+  if (d.view) { S.settings.view = d.view; saveSettings(); ticketListOpen = true; renderStudy(); return; }
+  if (d.ticket) {
+    const key = +d.ticket;
+    if (runActive() && S.run.key === key) { ticketListOpen = false; renderStudy(); window.scrollTo(0, 0); }
+    else startTicket(key);
+    return;
+  }
+  if (d.tgrade) { ticketAnswer(+d.tgrade); return; }
+  if (d.act === 'tcontinue') { ticketListOpen = false; renderStudy(); window.scrollTo(0, 0); return; }
+  if (d.act === 'tlist') {
+    if (S.run && S.run.done) { S.run = null; saveRun(); }
+    ticketListOpen = true; renderStudy(); window.scrollTo(0, 0); return;
+  }
+  if (d.act === 'tnext') { startTicket(nextTicketKey(S.run && typeof S.run.key === 'number' ? S.run.key : 0)); return; }
+  if (d.act === 'trandom') { startTicket(randomTicketKey()); return; }
+  if (d.act === 'terrors') { startTicket('errors'); return; }
+  if (d.act === 'tretry') { startTicket(S.run.key); return; }
   if (d.act === 'skip') { nextCard(); return; }
   if (d.act === 'details') { detailsOpen = !detailsOpen; renderStudy(); return; }
   if (d.grade) { grade(current, +d.grade); nextCard(); return; }
@@ -811,7 +990,7 @@ document.addEventListener('click', async e => {
   if (d.act === 'peek-details') { iDetails = !iDetails; renderInterviewResults(); return; }
   if (d.act === 'iclear') { iQuery = ''; iOpen = null; const f = $('#isearch'); f.value = ''; renderInterviewResults(); f.focus(); return; }
   if (d.status) { statusFilter = d.status; renderCatalog(); return; }
-  if (d.study) { forcedNext = d.study; current = null; location.hash = '#/study'; return; }
+  if (d.study) { forcedNext = d.study; current = null; S.settings.view = 'cards'; saveSettings(); location.hash = '#/study'; return; }
   if (d.act === 'back') { if (history.length > 1) history.back(); else location.hash = '#/catalog'; return; }
   if (d.themeSet) { S.settings.theme = d.themeSet; saveSettings(); applyTheme(); renderSettings(); return; }
   if (d.goal) { S.settings.goal = +d.goal; saveSettings(); renderSettings(); return; }
@@ -876,10 +1055,11 @@ document.addEventListener('input', e => {
   if (e.target.id === 'isearch') { iQuery = e.target.value; iOpen = null; renderInterviewResults(); }
 });
 document.addEventListener('keydown', e => {
-  if (!current || (location.hash || '#/study') !== '#/study' || e.target.closest('input, textarea') || document.querySelector('.overlay')) return;
-  if (!revealed && (e.key === ' ' || e.key === 'Enter') && !e.target.closest('button')) { e.preventDefault(); revealed = true; renderStudy(); }
-  else if (revealed && ['1', '2', '3'].includes(e.key)) { grade(current, +e.key - 1); nextCard(); }
-  else if (revealed && e.key.toLowerCase() === 'd') { detailsOpen = !detailsOpen; renderStudy(); }
+  if ((location.hash || '#/study') !== '#/study' || e.target.closest('input, textarea') || document.querySelector('.overlay')) return;
+  const press = sel => { const b = document.querySelector(sel); if (b) { e.preventDefault(); b.click(); } return !!b; };
+  if ((e.key === ' ' || e.key === 'Enter') && !e.target.closest('button')) press('[data-act="reveal"], [data-act="treveal"]');
+  else if (['1', '2', '3'].includes(e.key)) press('[data-grade="' + (e.key - 1) + '"], [data-tgrade="' + (e.key - 1) + '"]');
+  else if (e.key.toLowerCase() === 'd') press('.details-toggle');
 });
 
 /* ---------- Boot ---------- */
@@ -893,6 +1073,7 @@ async function loadData() {
   CAT_COUNT = {};
   QS.forEach(q => { CAT_COUNT[q.cat] = (CAT_COUNT[q.cat] || 0) + 1; });
   EXP = eRes && eRes.ok ? parseExperience(await eRes.text()) : {};
+  TICKETS = buildTickets();
   const unknown = Object.keys(EXP).filter(id => !BY_ID[id]);
   if (unknown.length) console.warn('experience.md: unknown question ids', unknown);
 }
