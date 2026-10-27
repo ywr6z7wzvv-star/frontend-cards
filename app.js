@@ -7,6 +7,13 @@ let BY_ID = {};
 let CAT_NAME = {};
 let CAT_COUNT = {};
 let EXP = {};            // question id -> markdown story from data/experience.md
+let RU = {};             // question id -> { q, s, d } from data/questions.ru.md
+let EXP_RU = {};         // question id -> story from data/experience.ru.md
+const isRu = () => S.settings.lang === 'ru';
+// Text of a question field in the chosen language; falls back to English when not translated yet.
+function T(q, f) { return (isRu() && RU[q.id] && RU[q.id][f]) || q[f]; }
+function expText(id) { return (isRu() && EXP_RU[id]) || EXP[id]; }
+const L = (en, ru) => isRu() ? ru : en;
 
 /* ---------- Constants ---------- */
 const MIN = 60e3, HOUR = 60 * MIN, DAY = 24 * HOUR;
@@ -25,7 +32,7 @@ function defaults() {
     days: {},
     tickets: {},    // ticket number -> { attempts, best, last, passed, ts }
     run: null,      // ticket in progress: { key, ids, i, answers }
-    settings: { theme: 'auto', details: false, exp: true, onlyExp: false, goal: 20, mode: 'smart', cats: null, view: 'cards' },
+    settings: { theme: 'auto', details: false, exp: true, onlyExp: false, goal: 20, mode: 'smart', cats: null, view: 'cards', lang: 'en' },
   };
 }
 let S = defaults();
@@ -234,6 +241,10 @@ function streak() {
   while (S.days[dayKey(t)]) { n++; t -= DAY; }
   return n;
 }
+function updateLang() {
+  const b = $('#langBtn');
+  if (b) { b.textContent = isRu() ? 'RU' : 'EN'; b.setAttribute('aria-label', isRu() ? 'Язык вопросов: русский' : 'Язык вопросов: английский'); }
+}
 function updatePill() {
   const n = streak(), today = S.days[dayKey()] || 0;
   $('#streakPill').innerHTML = '🔥 ' + n + ' ' + plural(n, 'день', 'дня', 'дней') + ' · ' + today + ' сегодня';
@@ -400,9 +411,33 @@ function parseExperience(text) {
   }
   return out;
 }
+/* data/questions.ru.md format:
+     ## <question-id>
+     Заголовок вопроса
+     --- short
+     короткий ответ
+     --- details
+     подробный ответ
+   Any part may be missing: the English text is shown instead. */
+function parseRuQuestions(text) {
+  const out = {};
+  // Text before the first "## id" (the header note) is dropped. Comments inside answers are kept:
+  // some code examples contain <!-- --> on purpose.
+  const parts = text.split(/^##[ \t]+([\w-]+)[ \t]*$/m);
+  for (let i = 1; i < parts.length; i += 2) {
+    const [title, rest = ''] = parts[i + 1].split(/^---[ \t]+short[ \t]*$/m);
+    const [short, details = ''] = rest.split(/^---[ \t]+details[ \t]*$/m);
+    const e = {};
+    if (title.trim()) e.q = title.trim();
+    if (short.trim()) e.s = short.trim();
+    if (details.trim()) e.d = details.trim();
+    out[parts[i]] = e;
+  }
+  return out;
+}
 function expBlock(id) {
   if (!EXP[id] || !S.settings.exp) return '';
-  return '<div class="exp md"><div class="label">From my experience</div>' + md(EXP[id]) + '</div>';
+  return '<div class="exp md"><div class="label">' + L('From my experience', 'Из моего опыта') + '</div>' + md(expText(id)) + '</div>';
 }
 
 /* ---------- Search ----------
@@ -451,7 +486,15 @@ function wordVariants(word) {
 const plain = s => s.replace(/`/g, '').toLowerCase();
 let searchIndex = null;
 function buildIndex() {
-  searchIndex = QS.map(q => ({ q, title: plain(q.q), short: plain(q.s), rest: plain(q.d + ' ' + (EXP[q.id] || '')) }));
+  searchIndex = QS.map(q => {
+    const ru = RU[q.id] || {};
+    return {
+      q,
+      title: plain(q.q + ' ' + (ru.q || '')),
+      short: plain(q.s + ' ' + (ru.s || '')),
+      rest: plain(q.d + ' ' + (ru.d || '') + ' ' + (EXP[q.id] || '') + ' ' + (EXP_RU[q.id] || '')),
+    };
+  });
 }
 // Returns { title: [...], body: [...], words } — words are the variant lists, for highlighting.
 function search(text, filter = () => true) {
@@ -525,17 +568,17 @@ const VIEW_SWITCH = () => '<div class="toolbar"><div class="seg full two" role="
 
 // Question card used by both the card deck and tickets. `t` prefixes the action names for tickets.
 function questionArticle(q, t) {
-  let h = '<article class="card' + (animateNext ? ' fade-in' : '') + '">' + metaRow(q) + '<h2 class="question">' + inline(q.q) + '</h2>';
+  let h = '<article class="card' + (animateNext ? ' fade-in' : '') + '">' + metaRow(q) + '<h2 class="question">' + inline(T(q, 'q')) + '</h2>';
   if (!revealed) {
     h += '<p class="hint">Ответь вслух, как на собеседовании, а потом открой ответ и честно оцени себя.' +
       (EXP[q.id] && S.settings.exp ? ' <strong>💼 Тут есть история из опыта</strong> — попробуй вспомнить свой пример.' : '') + '</p>' +
       '<div class="reveal-row"><button class="btn primary" data-act="' + (t ? 'treveal' : 'reveal') + '">Показать ответ</button>' +
       (t ? '' : '<button class="btn" data-act="skip" aria-label="Пропустить">Пропустить</button>') + '</div>';
   } else {
-    h += '<div class="short md"><div class="label">Short answer</div>' + md(q.s) + '</div>';
+    h += '<div class="short md"><div class="label">' + L('Short answer', 'Коротко') + '</div>' + md(T(q, 's')) + '</div>';
     h += expBlock(q.id);
     h += '<button class="details-toggle" data-act="details" aria-expanded="' + detailsOpen + '">' + (detailsOpen ? 'Скрыть подробности ▴' : 'Подробный ответ ▾') + '</button>';
-    if (detailsOpen) h += '<div class="details md">' + md(q.d) + '</div>';
+    if (detailsOpen) h += '<div class="details md">' + md(T(q, 'd')) + '</div>';
   }
   h += '</article>';
   if (revealed) {
@@ -715,7 +758,7 @@ function renderTicketResult() {
   const wrong = run.ids.map((id, i) => [id, run.answers[i]]).filter(([, g]) => g !== 2);
   if (wrong.length) {
     h += '<div class="section-title">' + (errors ? 'Ещё не выучены' : 'Ошибки') + ' · ' + wrong.length + '</div><div class="list">' +
-      wrong.map(([id, g]) => '<a class="item" href="#/q/' + id + '"><span class="dot ' + (g === 0 ? 'weak' : 'learning') + '" aria-hidden="true"></span><span class="t">' + inline(BY_ID[id].q) +
+      wrong.map(([id, g]) => '<a class="item" href="#/q/' + id + '"><span class="dot ' + (g === 0 ? 'weak' : 'learning') + '" aria-hidden="true"></span><span class="t">' + inline(T(BY_ID[id], 'q')) +
         '<span class="c"><span>' + (g === 0 ? 'Не знал' : 'Сомневался') + '</span><span>' + esc(CAT_NAME[BY_ID[id].cat]) + '</span></span></span></a>').join('') + '</div>';
   }
   h += '<div class="detail-actions tk-after">' +
@@ -745,7 +788,7 @@ function statusMatches(q) {
 }
 function catalogItem(q, words) {
   const st = status(q.id);
-  const title = words ? markMatches(inline(q.q), words) : inline(q.q);
+  const title = words ? markMatches(inline(T(q, 'q')), words) : inline(T(q, 'q'));
   return '<a class="item" href="#/q/' + q.id + '"><span class="dot ' + st + '" aria-hidden="true"></span><span class="t">' + title +
     '<span class="c"><span>' + STATUS_LABEL[st] + '</span>' + (words ? '<span>' + esc(CAT_NAME[q.cat]) + '</span>' : '') +
     (q.x ? '<span>Senior+</span>' : '') + (EXP[q.id] ? '<span>💼 опыт</span>' : '') + (S.fav[q.id] ? '<span>★</span>' : '') + '</span></span></a>';
@@ -780,12 +823,12 @@ let iQuery = '', iOpen = null, iDetails = false;
 function interviewItem(q, words) {
   const open = iOpen === q.id;
   let h = '<div class="qa' + (open ? ' open' : '') + '"><button class="qa-head" data-peek="' + q.id + '" aria-expanded="' + open + '">' +
-    '<span class="t">' + markMatches(inline(q.q), words) + '</span><span class="qa-cat">' + esc(CAT_NAME[q.cat]) + (EXP[q.id] ? ' · 💼' : '') + '</span></button>';
+    '<span class="t">' + markMatches(inline(T(q, 'q')), words) + '</span><span class="qa-cat">' + esc(CAT_NAME[q.cat]) + (EXP[q.id] ? ' · 💼' : '') + '</span></button>';
   if (open) {
-    h += '<div class="qa-body"><div class="short md"><div class="label">Short answer</div>' + markMatches(md(q.s), words) + '</div>' +
-      (EXP[q.id] && S.settings.exp ? '<div class="exp md"><div class="label">From my experience</div>' + markMatches(md(EXP[q.id]), words) + '</div>' : '') +
+    h += '<div class="qa-body"><div class="short md"><div class="label">' + L('Short answer', 'Коротко') + '</div>' + markMatches(md(T(q, 's')), words) + '</div>' +
+      (EXP[q.id] && S.settings.exp ? '<div class="exp md"><div class="label">' + L('From my experience', 'Из моего опыта') + '</div>' + markMatches(md(expText(q.id)), words) + '</div>' : '') +
       '<button class="details-toggle" data-act="peek-details" aria-expanded="' + iDetails + '">' + (iDetails ? 'Скрыть подробности ▴' : 'Подробный ответ ▾') + '</button>' +
-      (iDetails ? '<div class="details md">' + markMatches(md(q.d), words) + '</div>' : '') + '</div>';
+      (iDetails ? '<div class="details md">' + markMatches(md(T(q, 'd')), words) + '</div>' : '') + '</div>';
   }
   return h + '</div>';
 }
@@ -819,10 +862,10 @@ function renderDetail(id) {
   let info = STATUS_LABEL[st];
   if (c) info += ' · повторений: ' + c.seen + ' · следующее: ' + (c.due <= Date.now() ? 'сейчас' : 'через ' + fmtInterval(c.due - Date.now()));
   view.innerHTML = '<button class="back" data-act="back">‹ Назад</button>' +
-    '<article class="card">' + metaRow(q) + '<h2 class="question">' + inline(q.q) + '</h2>' +
-    '<div class="short md"><div class="label">Short answer</div>' + md(q.s) + '</div>' +
+    '<article class="card">' + metaRow(q) + '<h2 class="question">' + inline(T(q, 'q')) + '</h2>' +
+    '<div class="short md"><div class="label">' + L('Short answer', 'Коротко') + '</div>' + md(T(q, 's')) + '</div>' +
     expBlock(q.id) +
-    '<div class="details md">' + md(q.d) + '</div>' +
+    '<div class="details md">' + md(T(q, 'd')) + '</div>' +
     '<p class="count-line">' + esc(info) + '</p>' +
     '<div class="detail-actions"><button class="btn primary" data-study="' + id + '">Учить эту карточку</button></div></article>';
 }
@@ -858,6 +901,18 @@ function renderProgress() {
   view.innerHTML = h;
 }
 
+// Screen numbers for debugging iOS layout issues (shown small at the bottom of Settings).
+function screenDiag() {
+  const probe = document.createElement('div');
+  probe.style.cssText = 'position:fixed;visibility:hidden;padding-top:env(safe-area-inset-top);padding-bottom:env(safe-area-inset-bottom)';
+  document.body.appendChild(probe);
+  const cs = getComputedStyle(probe), nav = document.querySelector('nav.tabs').getBoundingClientRect();
+  const out = 'экран ' + screen.width + '×' + screen.height + ' · окно ' + innerWidth + '×' + innerHeight +
+    ' · vv ' + Math.round(window.visualViewport ? visualViewport.height : 0) + ' · inset ' + parseInt(cs.paddingTop) + '/' + parseInt(cs.paddingBottom) +
+    ' · меню до ' + Math.round(nav.bottom) + ' · ' + (isStandalone() ? 'standalone' : 'browser');
+  probe.remove();
+  return out;
+}
 function renderSettings() {
   const themes = [['auto', 'Авто'], ['dark', 'Тёмная'], ['light', 'Светлая']];
   const goals = [10, 20, 30, 50];
@@ -880,7 +935,8 @@ function renderSettings() {
     '<p class="count-line">Бэкап на случай смены телефона. Код или файл можно загрузить на другом устройстве.</p>' +
     '<div class="detail-actions"><button class="btn" data-act="export">Показать код</button><button class="btn" data-act="file">Сохранить файлом</button><button class="btn" data-act="import">Вставить код</button></div><div id="io"></div></div>' +
     '<div class="section-title">Сброс</div><div class="card"><div class="detail-actions"><button class="btn danger" data-act="reset">Сбросить весь прогресс</button></div></div>' +
-    '<p class="count-line" style="text-align:center;margin-top:18px">' + QS.length + ' вопросов · ' + DATA.cats.length + ' тем · ' + expCount + ' ' + plural(expCount, 'история', 'истории', 'историй') + ' из опыта</p>';
+    '<p class="count-line" style="text-align:center;margin-top:18px">' + QS.length + ' вопросов · ' + DATA.cats.length + ' тем · ' + expCount + ' ' + plural(expCount, 'история', 'истории', 'историй') + ' из опыта</p>' +
+    '<p class="count-line diag">' + screenDiag() + '</p>';
 }
 
 /* ---------- Backup ---------- */
@@ -991,6 +1047,7 @@ document.addEventListener('click', async e => {
     toast(S.fav[d.fav] ? 'Добавлено в избранное' : 'Убрано из избранного');
     return;
   }
+  if (d.act === 'lang') { S.settings.lang = isRu() ? 'en' : 'ru'; saveSettings(); updateLang(); route(); toast(isRu() ? 'Вопросы на русском' : 'Questions in English'); return; }
   if (d.act === 'reveal' || d.act === 'treveal') { revealed = true; renderStudy(); return; }
   if (d.view) { S.settings.view = d.view; saveSettings(); ticketListOpen = true; renderStudy(); return; }
   if (d.ticket) {
@@ -1100,7 +1157,10 @@ document.addEventListener('keydown', e => {
 
 /* ---------- Boot ---------- */
 async function loadData() {
-  const [qRes, eRes] = await Promise.all([fetch('data/questions.json'), fetch('data/experience.md').catch(() => null)]);
+  const opt = url => fetch(url).then(r => (r.ok ? r : null)).catch(() => null);
+  const [qRes, eRes, ruRes, eRuRes] = await Promise.all([
+    fetch('data/questions.json'), opt('data/experience.md'), opt('data/questions.ru.md'), opt('data/experience.ru.md'),
+  ]);
   if (!qRes.ok) throw new Error('questions.json: HTTP ' + qRes.status);
   DATA = await qRes.json();
   QS = DATA.qs;
@@ -1108,7 +1168,9 @@ async function loadData() {
   CAT_NAME = Object.fromEntries(DATA.cats.map(c => [c.id, c.name]));
   CAT_COUNT = {};
   QS.forEach(q => { CAT_COUNT[q.cat] = (CAT_COUNT[q.cat] || 0) + 1; });
-  EXP = eRes && eRes.ok ? parseExperience(await eRes.text()) : {};
+  EXP = eRes ? parseExperience(await eRes.text()) : {};
+  RU = ruRes ? parseRuQuestions(await ruRes.text()) : {};
+  EXP_RU = eRuRes ? parseExperience(await eRuRes.text()) : {};
   TICKETS = buildTickets();
   const unknown = Object.keys(EXP).filter(id => !BY_ID[id]);
   if (unknown.length) console.warn('experience.md: unknown question ids', unknown);
@@ -1126,6 +1188,7 @@ async function boot() {
   await initStorage();
   applyTheme();
   updatePill();
+  updateLang();
   window.addEventListener('hashchange', route);
   route();
 }

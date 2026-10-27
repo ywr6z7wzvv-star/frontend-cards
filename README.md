@@ -11,6 +11,8 @@
 | `app.js` | Вся логика: интервальные повторения, рендер markdown, IndexedDB |
 | `data/questions.json` | Вопросы: `id`, `cat`, `q` (вопрос), `s` (short answer), `d` (подробно), `x` (Senior+) |
 | `data/experience.md` | Истории «From my experience» к вопросам — правь как обычный текст |
+| `data/questions.ru.md` | Русский перевод вопросов (кнопка EN/RU в шапке). Формат: `## id`, заголовок, `--- short`, `--- details` |
+| `data/experience.ru.md` | Русские версии историй, тот же формат, что у `experience.md` |
 | `sw.js` | Service worker: офлайн-кэш, стратегия network first |
 | `manifest.webmanifest` | Имя, иконки, standalone-режим |
 
@@ -31,6 +33,8 @@
 ```
 
 `id` вопроса видно в адресе карточки в каталоге (`#/q/js-closure`). Комментарии `<!-- -->` в приложении не показываются.
+
+Если меняешь историю, поправь и русскую версию в `data/experience.ru.md`. Если её там нет, при выбранном RU покажется английская.
 
 ## Локальный запуск
 

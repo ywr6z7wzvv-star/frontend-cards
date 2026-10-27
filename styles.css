@@ -305,3 +305,8 @@ mark { background: rgba(240,180,41,.28); color: inherit; border-radius: 3px; pad
 .tk-score { font-size: 15px; color: var(--muted); margin: 6px 0 2px; }
 .tk-score b { font-size: 40px; color: var(--text); }
 .tk-after { margin-top: 16px; }
+.count-line.diag { text-align: center; font-size: 11px; color: var(--faint); margin-top: 4px; }
+.pill.lang { font-weight: 800; color: var(--accent); letter-spacing: .04em; min-width: 44px; justify-content: center; }
+header.top h1 { white-space: nowrap; }
+header.top h1 b { font-weight: inherit; }
+@media (max-width: 400px) { header.top .h-long { display: none; } }
