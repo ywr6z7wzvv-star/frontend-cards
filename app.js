@@ -909,7 +909,7 @@ function screenDiag() {
   const cs = getComputedStyle(probe), nav = document.querySelector('nav.tabs').getBoundingClientRect();
   const out = 'экран ' + screen.width + '×' + screen.height + ' · окно ' + innerWidth + '×' + innerHeight +
     ' · vv ' + Math.round(window.visualViewport ? visualViewport.height : 0) + ' · inset ' + parseInt(cs.paddingTop) + '/' + parseInt(cs.paddingBottom) +
-    ' · меню до ' + Math.round(nav.bottom) + ' · ' + (isStandalone() ? 'standalone' : 'browser');
+    ' · меню до ' + Math.round(nav.bottom) + ' · док ' + document.documentElement.scrollHeight + ' · ' + (isStandalone() ? 'standalone' : 'browser');
   probe.remove();
   return out;
 }
