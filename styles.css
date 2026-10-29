@@ -312,3 +312,10 @@ mark { background: rgba(240,180,41,.28); color: inherit; border-radius: 3px; pad
 header.top h1 { white-space: nowrap; }
 header.top h1 b { font-weight: inherit; }
 @media (max-width: 400px) { header.top .h-long { display: none; } }
+
+/* Sync */
+.sync-steps { margin: 4px 0 12px; padding-left: 20px; font-size: 14px; color: var(--muted); }
+.sync-steps li { margin: 6px 0; }
+.sync-steps a { color: var(--accent); }
+.sync-form { display: flex; gap: 8px; }
+.sync-form .search { margin: 0; flex: 1; min-width: 0; font-size: 16px; }

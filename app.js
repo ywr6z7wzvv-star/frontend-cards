@@ -32,6 +32,8 @@ function defaults() {
     days: {},
     tickets: {},    // ticket number -> { attempts, best, last, passed, ts }
     run: null,      // ticket in progress: { key, ids, i, answers }
+    favDel: {},     // question id -> time it was removed from favorites (for sync)
+    resetAt: 0,     // time of the last "reset progress" (for sync)
     settings: { theme: 'auto', details: false, exp: true, onlyExp: false, goal: 20, mode: 'smart', cats: null, view: 'cards', lang: 'en' },
   };
 }
@@ -41,7 +43,7 @@ let reviewsCount = 0;
 /* ---------- Storage: IndexedDB ----------
    Database "fe-cards":
      cards   – key: question id, value: { box, due, seen, ok, fail, doubt, okStreak, last }
-     kv      – keys: 'fav', 'days', 'settings', 'tickets', 'run'
+     kv      – keys: 'fav', 'favDel', 'days', 'settings', 'tickets', 'run', 'resetAt', 'sync'
      reviews – auto-increment log of every answer: { id, grade, box, ts }
    If IndexedDB is unavailable, everything falls back to one localStorage key. */
 const DB_NAME = 'fe-cards', DB_VERSION = 1;
@@ -68,15 +70,15 @@ const idb = {
   async load() {
     const tx = this.db.transaction(['cards', 'kv', 'reviews'], 'readonly');
     const cs = tx.objectStore('cards'), kv = tx.objectStore('kv');
-    const [keys, vals, fav, days, settings, tickets, run, count] = await Promise.all([
+    const [keys, vals, fav, days, settings, tickets, run, favDel, resetAt, count] = await Promise.all([
       reqP(cs.getAllKeys()), reqP(cs.getAll()),
       reqP(kv.get('fav')), reqP(kv.get('days')), reqP(kv.get('settings')),
-      reqP(kv.get('tickets')), reqP(kv.get('run')),
+      reqP(kv.get('tickets')), reqP(kv.get('run')), reqP(kv.get('favDel')), reqP(kv.get('resetAt')),
       reqP(tx.objectStore('reviews').count()),
     ]);
     const cards = {};
     keys.forEach((k, i) => { cards[k] = vals[i]; });
-    return { cards, fav, days, settings, tickets, run, reviewsCount: count, empty: !settings && !keys.length };
+    return { cards, fav, days, settings, tickets, run, favDel, resetAt, reviewsCount: count, empty: !settings && !keys.length };
   },
   write(stores, fn) {
     const tx = this.db.transaction(stores, 'readwrite');
@@ -91,6 +93,7 @@ const idb = {
     });
   },
   putKV(key, value) { return this.write(['kv'], tx => tx.objectStore('kv').put(value, key)); },
+  getKV(key) { return reqP(this.db.transaction('kv').objectStore('kv').get(key)); },
   putCards(cards) { return this.write(['cards'], tx => Object.entries(cards).forEach(([id, c]) => tx.objectStore('cards').put(c, id))); },
   reviews() { return reqP(this.db.transaction('reviews').objectStore('reviews').getAll()); },
   replace(state, reviews) {
@@ -100,6 +103,7 @@ const idb = {
       Object.entries(state.cards).forEach(([id, c]) => cs.put(c, id));
       kv.put(state.fav, 'fav'); kv.put(state.days, 'days'); kv.put(state.settings, 'settings');
       kv.put(state.tickets || {}, 'tickets'); kv.put(state.run || null, 'run');
+      kv.put(state.favDel || {}, 'favDel'); kv.put(state.resetAt || 0, 'resetAt');
       (reviews || []).forEach(r => rs.add(r));
     });
   },
@@ -110,11 +114,12 @@ const ls = {
   load() {
     const raw = localStorage.getItem(LEGACY_LS_KEY);
     const s = raw ? JSON.parse(raw) : {};
-    return { cards: s.cards || {}, fav: s.fav, days: s.days, settings: s.settings, tickets: s.tickets, run: s.run, reviewsCount: 0, empty: !raw };
+    return { cards: s.cards || {}, fav: s.fav, days: s.days, settings: s.settings, tickets: s.tickets, run: s.run, favDel: s.favDel, resetAt: s.resetAt, reviewsCount: 0, empty: !raw };
   },
   dump() { localStorage.setItem(LEGACY_LS_KEY, JSON.stringify(S)); return Promise.resolve(); },
   answer() { return this.dump(); },
   putKV() { return this.dump(); },
+  getKV() { return Promise.resolve(null); },
   putCards() { return this.dump(); },
   reviews() { return Promise.resolve([]); },
   replace() { return this.dump(); },
@@ -156,6 +161,7 @@ async function initStorage() {
   S = mergeState(loaded);
   reviewsCount = loaded.reviewsCount || 0;
   await backfillStreaks();
+  try { syncCfg = await backend.getKV('sync'); } catch (err) { syncCfg = null; }
 
   // Ask the browser not to evict our data under storage pressure.
   try {
@@ -195,11 +201,11 @@ function mergeState(s) {
   const settings = { ...d.settings, ...(s.settings || {}) };
   const allCats = DATA.cats.map(c => c.id);
   settings.cats = Array.isArray(settings.cats) ? settings.cats.filter(c => allCats.includes(c)) : allCats;
-  return { cards: s.cards || {}, fav: s.fav || {}, days: s.days || {}, tickets: s.tickets || {}, run: s.run || null, settings };
+  return { cards: s.cards || {}, fav: s.fav || {}, days: s.days || {}, tickets: s.tickets || {}, run: s.run || null, favDel: s.favDel || {}, resetAt: s.resetAt || 0, settings };
 }
 const saveSettings = () => persist(backend.putKV('settings', S.settings));
-const saveFav = () => persist(backend.putKV('fav', S.fav));
-const saveTickets = () => persist(backend.putKV('tickets', S.tickets));
+const saveFav = () => { touched(); return persist(Promise.all([backend.putKV('fav', S.fav), backend.putKV('favDel', S.favDel)])); };
+const saveTickets = () => { touched(); return persist(backend.putKV('tickets', S.tickets)); };
 const saveRun = () => persist(backend.putKV('run', S.run));
 
 /* ---------- Helpers ---------- */
@@ -252,9 +258,10 @@ function updatePill() {
 const isStandalone = () => (window.matchMedia && matchMedia('(display-mode: standalone)').matches) || navigator.standalone === true;
 
 /* ---------- Spaced repetition ---------- */
-function nextState(id, grade) {
-  const now = Date.now();
-  const c = { box: 0, due: now, seen: 0, ok: 0, fail: 0, ...(card(id) || {}) };
+function nextState(id, grade) { return applyGrade(card(id), grade, Date.now()); }
+// One review applied to a card state. Pure: replaying the review log gives the same cards.
+function applyGrade(prev, grade, now) {
+  const c = { box: 0, due: now, seen: 0, ok: 0, fail: 0, ...(prev || {}) };
   if (grade === 0) { c.box = 0; c.fail++; }
   else if (grade === 1) { c.box = c.box > 2 ? c.box - 1 : Math.max(1, c.box); c.doubt = (c.doubt || 0) + 1; }
   else { c.box = Math.min(5, c.box + 1); c.ok++; }
@@ -270,6 +277,7 @@ function grade(id, g) {
   const k = dayKey(); S.days[k] = (S.days[k] || 0) + 1;
   reviewsCount++;
   persist(backend.answer(id, c, S.days, { id, grade: g, box: c.box, ts: c.last }));
+  touched();
   updatePill();
 }
 
@@ -682,7 +690,9 @@ function ticketAnswer(g) {
   run.answers[run.i] = g;
   if (run.key === 'errors' && g === 2) {
     // fixed: drop it from every ticket's mistake list
-    Object.values(S.tickets).forEach(t => { if (t.mistakes) t.mistakes = t.mistakes.filter(x => x !== id); });
+    Object.values(S.tickets).forEach(t => {
+      if (t.mistakes && t.mistakes.includes(id)) { t.mistakes = t.mistakes.filter(x => x !== id); t.mts = Date.now(); }
+    });
     saveTickets();
   }
   run.i++;
@@ -931,6 +941,7 @@ function renderSettings() {
     Object.keys(S.cards).length + ' ' + plural(Object.keys(S.cards).length, 'карточка', 'карточки', 'карточек') + ' с прогрессом · ' +
     reviewsCount + ' ' + plural(reviewsCount, 'ответ', 'ответа', 'ответов') + ' в журнале · ' +
     (persisted ? 'постоянное хранилище ✓' : 'браузер может очистить данные') + '</p></div>' +
+    '<div class="section-title">Синхронизация</div><div class="card" id="syncCard">' + syncCardHtml() + '</div>' +
     '<div class="section-title">Перенос прогресса</div><div class="card">' +
     '<p class="count-line">Бэкап на случай смены телефона. Код или файл можно загрузить на другом устройстве.</p>' +
     '<div class="detail-actions"><button class="btn" data-act="export">Показать код</button><button class="btn" data-act="file">Сохранить файлом</button><button class="btn" data-act="import">Вставить код</button></div><div id="io"></div></div>' +
@@ -942,7 +953,7 @@ function renderSettings() {
 /* ---------- Backup ---------- */
 async function backupJson() {
   const reviews = await backend.reviews().catch(() => []);
-  return JSON.stringify({ v: 2, exported: new Date().toISOString(), cards: S.cards, fav: S.fav, days: S.days, tickets: S.tickets, reviews });
+  return JSON.stringify({ v: 2, exported: new Date().toISOString(), cards: S.cards, fav: S.fav, favDel: S.favDel, days: S.days, tickets: S.tickets, reviews });
 }
 const toB64 = s => btoa(unescape(encodeURIComponent(s)));
 const fromB64 = s => decodeURIComponent(escape(atob(s)));
@@ -951,12 +962,268 @@ async function applyBackup(text) {
   const obj = JSON.parse(text.startsWith('{') ? text : fromB64(text));
   if (!obj || typeof obj !== 'object' || !obj.cards) throw new Error('bad backup');
   S.cards = obj.cards || {}; S.fav = obj.fav || {}; S.days = obj.days || {};
-  S.tickets = obj.tickets || {}; S.run = null;
+  S.tickets = obj.tickets || {}; S.run = null; S.favDel = obj.favDel || {};
   const reviews = Array.isArray(obj.reviews) ? obj.reviews : [];
   await backend.replace(S, reviews);
   reviewsCount = reviews.length;
   await backfillStreaks();
+  touched();
 }
+
+/* ---------- Sync between devices (secret GitHub Gist) ----------
+   Every device keeps its own IndexedDB. Sync = read the gist, merge, write both ways.
+   Merge rules:
+     • review log: union of both logs (no duplicates); card levels, "weak", streaks
+       and day counts are recomputed by replaying the merged log
+     • favorites: per question, the latest add/remove wins
+     • tickets: per ticket, the latest change wins
+     • reset: the latest reset wins and drops everything older
+   The token lives only in this device's IndexedDB (kv 'sync'), never in backups. */
+const SYNC_FILE = 'fe-cards-sync.json';
+const GH_API = 'https://api.github.com';
+let syncCfg = null;        // { token, login, gistId, last, error }
+let syncing = null;        // promise of the sync in progress
+let syncTimer = null;
+let localEdits = 0;        // bumped on every local change, to detect edits during a sync
+
+function touched() { localEdits++; scheduleSync(); }
+function scheduleSync(delay = 20000) {
+  if (!syncCfg || !syncCfg.token) return;
+  clearTimeout(syncTimer);
+  syncTimer = setTimeout(() => { syncTimer = null; syncNow({ silent: true }); }, delay);
+}
+const saveSyncCfg = () => persist(backend.putKV('sync', syncCfg));
+
+async function gh(path, opts = {}) {
+  const headers = {
+    Accept: 'application/vnd.github+json',
+    Authorization: 'Bearer ' + syncCfg.token,
+    'X-GitHub-Api-Version': '2022-11-28',
+  };
+  if (opts.body) headers['Content-Type'] = 'application/json';
+  const res = await fetch(GH_API + path, { ...opts, headers, cache: 'no-store' });
+  if (!res.ok) { const err = new Error('GitHub HTTP ' + res.status); err.status = res.status; throw err; }
+  return res.json();
+}
+function syncErrorText(err) {
+  if (!err.status) return 'Нет связи с GitHub';
+  if (err.status === 401) return 'Токен не подходит или отозван';
+  if (err.status === 403 || err.status === 404) return 'У токена нет доступа к Gist';
+  if (err.status === 422) return 'GitHub отклонил данные';
+  return 'Ошибка GitHub ' + err.status;
+}
+
+async function findSyncGist() {
+  for (let page = 1; page <= 5; page++) {
+    const list = await gh('/gists?per_page=100&page=' + page);
+    const hit = list.find(g => g.files && g.files[SYNC_FILE]);
+    if (hit) return gh('/gists/' + hit.id);
+    if (list.length < 100) return null;
+  }
+  return null;
+}
+async function readSyncGist(gist) {
+  const file = gist.files && gist.files[SYNC_FILE];
+  if (!file) return null;
+  const text = file.truncated ? await (await fetch(file.raw_url, { cache: 'no-store' })).text() : file.content;
+  try { return normalizeSnapshot(JSON.parse(text)); } catch (err) { console.warn('Broken sync file, will overwrite', err); return null; }
+}
+
+function normalizeSnapshot(x) {
+  x = x || {};
+  return {
+    resetAt: x.resetAt || 0,
+    reviews: Array.isArray(x.reviews) ? x.reviews.filter(r => Array.isArray(r) && r.length >= 3) : [],
+    fav: x.fav || {}, favDel: x.favDel || {},
+    tickets: x.tickets || {}, legacy: x.legacy || {}, days: x.days || {},
+  };
+}
+// This device's progress in the sync format. Reviews are [questionId, grade, timestamp].
+async function localSnapshot() {
+  const raw = await backend.reviews().catch(() => []);
+  const reviews = raw.map(r => [r.id, r.grade, r.ts]).sort((a, b) => a[2] - b[2]);
+  const inLog = new Set(reviews.map(r => r[0]));
+  const legacy = {};
+  Object.entries(S.cards).forEach(([id, c]) => { if (!inLog.has(id)) legacy[id] = c; });   // progress older than the log
+  return normalizeSnapshot({ resetAt: S.resetAt, reviews, fav: { ...S.fav }, favDel: { ...S.favDel }, tickets: S.tickets, legacy, days: { ...S.days } });
+}
+
+function mergeSnapshots(a, b) {
+  const resetAt = Math.max(a.resetAt, b.resetAt);
+  const seen = new Set(), reviews = [];
+  for (const r of [...a.reviews, ...b.reviews]) {
+    if (r[2] <= resetAt) continue;
+    const key = r[0] + '|' + r[1] + '|' + r[2];
+    if (!seen.has(key)) { seen.add(key); reviews.push([r[0], r[1], r[2]]); }
+  }
+  reviews.sort((x, y) => x[2] - y[2] || (x[0] < y[0] ? -1 : 1));
+
+  const fav = {}, favDel = {};
+  new Set([...Object.keys(a.fav), ...Object.keys(b.fav), ...Object.keys(a.favDel), ...Object.keys(b.favDel)]).forEach(id => {
+    const add = Math.max(+a.fav[id] || 0, +b.fav[id] || 0), del = Math.max(+a.favDel[id] || 0, +b.favDel[id] || 0);
+    if (add > del && add > resetAt) fav[id] = add;
+    else if (del) favDel[id] = del;
+  });
+
+  const tTime = t => Math.max(t.ts || 0, t.mts || 0);
+  const tickets = {};
+  new Set([...Object.keys(a.tickets), ...Object.keys(b.tickets)]).forEach(k => {
+    const x = a.tickets[k], y = b.tickets[k];
+    const pick = !x ? y : !y ? x : (tTime(y) > tTime(x) ? y : x);
+    if (pick && tTime(pick) > resetAt) tickets[k] = pick;
+  });
+
+  const inLog = new Set(reviews.map(r => r[0]));
+  const legacy = {};
+  new Set([...Object.keys(a.legacy), ...Object.keys(b.legacy)]).forEach(id => {
+    if (inLog.has(id)) return;
+    const x = a.legacy[id], y = b.legacy[id];
+    const pick = !x ? y : !y ? x : ((y.last || 0) > (x.last || 0) ? y : x);
+    if (pick && (pick.last || 0) > resetAt) legacy[id] = pick;
+  });
+
+  // Answers per day: the larger count from either device or from the merged log
+  // (older days may predate the log). After a reset only the log counts.
+  const logDays = {};
+  reviews.forEach(r => { const k = dayKey(r[2]); logDays[k] = (logDays[k] || 0) + 1; });
+  const resetDay = resetAt ? dayKey(resetAt) : '';
+  const days = {};
+  new Set([...Object.keys(a.days), ...Object.keys(b.days), ...Object.keys(logDays)]).forEach(k => {
+    if (resetDay && k < resetDay) return;
+    const n = resetDay && k === resetDay ? (logDays[k] || 0) : Math.max(a.days[k] || 0, b.days[k] || 0, logDays[k] || 0);
+    if (n) days[k] = n;
+  });
+
+  return { resetAt, reviews, fav, favDel, tickets, legacy, days };
+}
+
+// Card states for a snapshot: legacy cards plus a replay of the review log.
+function replaySnapshot(m) {
+  const cards = { ...m.legacy }, rows = [], started = new Set();
+  for (const [id, g, ts] of m.reviews) {
+    const prev = started.has(id) ? cards[id] : null;
+    started.add(id);
+    const c = applyGrade(prev, g, ts).c;
+    cards[id] = c;
+    rows.push({ id, grade: g, box: c.box, ts });
+  }
+  return { cards, rows };
+}
+const snapshotKey = m => JSON.stringify([m.resetAt, m.reviews, m.fav, m.favDel, m.tickets, m.legacy, m.days]);
+
+async function syncNow({ silent = false } = {}) {
+  if (!syncCfg || !syncCfg.token) return false;
+  if (syncing) return syncing;
+  clearTimeout(syncTimer); syncTimer = null;
+  syncing = (async () => {
+    try {
+      let gist = null;
+      if (syncCfg.gistId) gist = await gh('/gists/' + syncCfg.gistId).catch(err => { if (err.status === 404) return null; throw err; });
+      if (!gist) gist = await findSyncGist();
+      const remote = gist ? await readSyncGist(gist) : null;
+
+      // Merge with a fresh local snapshot; redo it if the user changed something meanwhile.
+      let local, merged, changed;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const editsBefore = localEdits;
+        local = await localSnapshot();
+        merged = remote ? mergeSnapshots(local, remote) : local;
+        changed = snapshotKey(merged) !== snapshotKey(local);
+        if (localEdits === editsBefore) break;
+      }
+      if (changed) {
+        const { cards, rows } = replaySnapshot(merged);
+        S.cards = cards; S.fav = merged.fav; S.favDel = merged.favDel; S.tickets = merged.tickets;
+        S.days = merged.days; S.resetAt = merged.resetAt;
+        if (S.run && !S.run.done && merged.resetAt > (local.resetAt || 0)) S.run = null;
+        await backend.replace(S, rows);
+        reviewsCount = rows.length;
+      }
+
+      const content = JSON.stringify({ app: 'fe-cards', v: 1, updated: Date.now(), ...merged });
+      if (!gist) {
+        gist = await gh('/gists', { method: 'POST', body: JSON.stringify({
+          description: 'Frontend Cards — прогресс тренажёра (не удалять)', public: false, files: { [SYNC_FILE]: { content } },
+        }) });
+      } else if (!remote || snapshotKey(merged) !== snapshotKey(remote)) {
+        await gh('/gists/' + gist.id, { method: 'PATCH', body: JSON.stringify({ files: { [SYNC_FILE]: { content } } }) });
+      }
+      syncCfg = { ...syncCfg, gistId: gist.id, last: Date.now(), error: null };
+      await saveSyncCfg();
+      if (changed) {
+        updatePill();
+        const page = (location.hash || '#/study').split('/')[1];
+        if (page === 'progress') renderProgress();
+      }
+      if (!silent) toast(changed ? 'Прогресс обновлён с другого устройства' : 'Синхронизировано');
+      return true;
+    } catch (err) {
+      console.warn('Sync failed', err);
+      syncCfg = { ...syncCfg, error: syncErrorText(err) };
+      await saveSyncCfg();
+      if (!silent) toast(syncCfg.error);
+      return false;
+    } finally {
+      syncing = null;
+      if ((location.hash || '').startsWith('#/settings')) renderSyncCard();
+    }
+  })();
+  return syncing;
+}
+
+async function connectSync(token) {
+  syncCfg = { token: token.trim() };
+  try {
+    const user = await gh('/user');
+    syncCfg.login = user.login;
+  } catch (err) {
+    const text = syncErrorText(err);
+    syncCfg = null;
+    throw new Error(text);
+  }
+  await saveSyncCfg();
+  return syncNow({ silent: false });
+}
+async function disconnectSync() {
+  clearTimeout(syncTimer);
+  syncCfg = null;
+  await persist(backend.putKV('sync', null));
+}
+
+// Sync when the app opens, comes back to the foreground or gets the network back,
+// and right away when it goes to the background with unsynced answers.
+document.addEventListener('visibilitychange', () => {
+  if (!syncCfg || !syncCfg.token) return;
+  if (document.visibilityState === 'hidden') { if (syncTimer) syncNow({ silent: true }); }
+  else if (!syncCfg.last || Date.now() - syncCfg.last > 60e3) syncNow({ silent: true });
+});
+window.addEventListener('online', () => syncNow({ silent: true }));
+
+function timeAgo(ts) {
+  const s = Math.round((Date.now() - ts) / 1000);
+  if (s < 60) return 'только что';
+  if (s < 3600) return Math.round(s / 60) + ' мин назад';
+  if (s < 86400) return Math.round(s / 3600) + ' ч назад';
+  return new Date(ts).toLocaleDateString('ru-RU');
+}
+function syncCardHtml() {
+  if (!syncCfg || !syncCfg.token) {
+    return '<p class="count-line">Прогресс будет общим для всех твоих устройств: ответы хранятся в секретном Gist на GitHub и сливаются, даже если занимался на двух устройствах без интернета.</p>' +
+      '<ol class="sync-steps">' +
+      '<li>Открой <a href="https://github.com/settings/tokens/new?scopes=gist&amp;description=FE%20Cards%20sync" target="_blank" rel="noopener">создание токена</a> на GitHub (в том аккаунте, где хочешь хранить прогресс). Галочка <b>gist</b> уже стоит, больше ничего не нужно. Срок действия — побольше или «No expiration».</li>' +
+      '<li>Нажми «Generate token», скопируй его и вставь ниже.</li>' +
+      '<li>На втором устройстве вставь тот же токен — прогресс подтянется сам.</li></ol>' +
+      '<div class="sync-form"><input id="syncToken" class="search" type="password" placeholder="ghp_…" autocomplete="off" autocapitalize="off" spellcheck="false">' +
+      '<button class="btn primary" data-act="sync-connect">Подключить</button></div>' +
+      '<p class="count-line">Токен хранится только на этом устройстве и не попадает в бэкапы.</p>';
+  }
+  const status = syncing ? 'синхронизирую…' : syncCfg.error ? '⚠️ ' + esc(syncCfg.error) : syncCfg.last ? 'последняя ' + timeAgo(syncCfg.last) : 'ещё не было';
+  return '<p class="count-line">Подключено' + (syncCfg.login ? ' к <b>' + esc(syncCfg.login) + '</b>' : '') + ' · ' + status + '</p>' +
+    '<div class="detail-actions"><button class="btn primary" data-act="sync-now"' + (syncing ? ' disabled' : '') + '>Синхронизировать сейчас</button>' +
+    '<button class="btn" data-act="sync-off">Отключить</button></div>' +
+    '<p class="count-line">Синхронизация идёт сама: при открытии приложения, после ответов и при сворачивании.</p>';
+}
+function renderSyncCard() { const el = $('#syncCard'); if (el) el.innerHTML = syncCardHtml(); }
 
 /* ---------- Sheets ---------- */
 function openSheet(html, onClick) {
@@ -1040,7 +1307,8 @@ document.addEventListener('click', async e => {
   if (!t || !QS.length) return;
   const d = t.dataset;
   if (d.fav) {
-    S.fav[d.fav] ? delete S.fav[d.fav] : (S.fav[d.fav] = 1);
+    if (S.fav[d.fav]) { delete S.fav[d.fav]; S.favDel[d.fav] = Date.now(); }
+    else { S.fav[d.fav] = Date.now(); delete S.favDel[d.fav]; }
     saveFav();
     t.setAttribute('aria-pressed', !!S.fav[d.fav]);
     t.innerHTML = S.fav[d.fav] ? ICON_STAR : ICON_STAR_O;
@@ -1127,11 +1395,27 @@ document.addEventListener('click', async e => {
     } catch (err) { toast('Код не подошёл'); }
     return;
   }
+  if (d.act === 'sync-connect') {
+    const token = ($('#syncToken') || {}).value || '';
+    if (!token.trim()) { toast('Вставь токен'); return; }
+    t.disabled = true; t.textContent = 'Подключаю…';
+    try { await connectSync(token); renderSettings(); }
+    catch (err) { toast(err.message); t.disabled = false; t.textContent = 'Подключить'; }
+    return;
+  }
+  if (d.act === 'sync-now') { const p = syncNow(); renderSyncCard(); await p; return; }
+  if (d.act === 'sync-off') {
+    confirmSheet('Отключить синхронизацию?', 'Прогресс на этом устройстве останется, но перестанет обмениваться с другими. Gist на GitHub не удаляется.', 'Отключить', async () => {
+      await disconnectSync(); toast('Синхронизация отключена'); renderSettings();
+    });
+    return;
+  }
   if (d.act === 'reset') {
-    confirmSheet('Сбросить прогресс?', 'Все уровни карточек, избранное, журнал ответов и статистика удалятся. Это нельзя отменить.', 'Сбросить', async () => {
-      S = { ...defaults(), settings: S.settings };
+    confirmSheet('Сбросить прогресс?', 'Все уровни карточек, избранное, журнал ответов и статистика удалятся' + (syncCfg && syncCfg.token ? ', в том числе на других синхронизированных устройствах' : '') + '. Это нельзя отменить.', 'Сбросить', async () => {
+      S = { ...defaults(), settings: S.settings, resetAt: Date.now() };
       await persist(backend.replace(S, []));
       reviewsCount = 0;
+      touched();
       updatePill(); current = null; toast('Прогресс сброшен'); renderSettings();
     });
   }
@@ -1191,6 +1475,7 @@ async function boot() {
   updateLang();
   window.addEventListener('hashchange', route);
   route();
+  if (syncCfg && syncCfg.token) syncNow({ silent: true });
 }
 boot();
 
