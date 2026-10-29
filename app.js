@@ -34,6 +34,7 @@ function defaults() {
     run: null,      // ticket in progress: { key, ids, i, answers }
     favDel: {},     // question id -> time it was removed from favorites (for sync)
     resetAt: 0,     // time of the last "reset progress" (for sync)
+    runTs: 0,       // time of the last change to the ticket in progress (for sync)
     settings: { theme: 'auto', details: false, exp: true, onlyExp: false, goal: 20, mode: 'smart', cats: null, view: 'cards', lang: 'en' },
   };
 }
@@ -70,15 +71,15 @@ const idb = {
   async load() {
     const tx = this.db.transaction(['cards', 'kv', 'reviews'], 'readonly');
     const cs = tx.objectStore('cards'), kv = tx.objectStore('kv');
-    const [keys, vals, fav, days, settings, tickets, run, favDel, resetAt, count] = await Promise.all([
+    const [keys, vals, fav, days, settings, tickets, run, favDel, resetAt, runTs, count] = await Promise.all([
       reqP(cs.getAllKeys()), reqP(cs.getAll()),
       reqP(kv.get('fav')), reqP(kv.get('days')), reqP(kv.get('settings')),
-      reqP(kv.get('tickets')), reqP(kv.get('run')), reqP(kv.get('favDel')), reqP(kv.get('resetAt')),
+      reqP(kv.get('tickets')), reqP(kv.get('run')), reqP(kv.get('favDel')), reqP(kv.get('resetAt')), reqP(kv.get('runTs')),
       reqP(tx.objectStore('reviews').count()),
     ]);
     const cards = {};
     keys.forEach((k, i) => { cards[k] = vals[i]; });
-    return { cards, fav, days, settings, tickets, run, favDel, resetAt, reviewsCount: count, empty: !settings && !keys.length };
+    return { cards, fav, days, settings, tickets, run, favDel, resetAt, runTs, reviewsCount: count, empty: !settings && !keys.length };
   },
   write(stores, fn) {
     const tx = this.db.transaction(stores, 'readwrite');
@@ -103,7 +104,7 @@ const idb = {
       Object.entries(state.cards).forEach(([id, c]) => cs.put(c, id));
       kv.put(state.fav, 'fav'); kv.put(state.days, 'days'); kv.put(state.settings, 'settings');
       kv.put(state.tickets || {}, 'tickets'); kv.put(state.run || null, 'run');
-      kv.put(state.favDel || {}, 'favDel'); kv.put(state.resetAt || 0, 'resetAt');
+      kv.put(state.favDel || {}, 'favDel'); kv.put(state.resetAt || 0, 'resetAt'); kv.put(state.runTs || 0, 'runTs');
       (reviews || []).forEach(r => rs.add(r));
     });
   },
@@ -114,7 +115,7 @@ const ls = {
   load() {
     const raw = localStorage.getItem(LEGACY_LS_KEY);
     const s = raw ? JSON.parse(raw) : {};
-    return { cards: s.cards || {}, fav: s.fav, days: s.days, settings: s.settings, tickets: s.tickets, run: s.run, favDel: s.favDel, resetAt: s.resetAt, reviewsCount: 0, empty: !raw };
+    return { cards: s.cards || {}, fav: s.fav, days: s.days, settings: s.settings, tickets: s.tickets, run: s.run, favDel: s.favDel, resetAt: s.resetAt, runTs: s.runTs, reviewsCount: 0, empty: !raw };
   },
   dump() { localStorage.setItem(LEGACY_LS_KEY, JSON.stringify(S)); return Promise.resolve(); },
   answer() { return this.dump(); },
@@ -201,12 +202,16 @@ function mergeState(s) {
   const settings = { ...d.settings, ...(s.settings || {}) };
   const allCats = DATA.cats.map(c => c.id);
   settings.cats = Array.isArray(settings.cats) ? settings.cats.filter(c => allCats.includes(c)) : allCats;
-  return { cards: s.cards || {}, fav: s.fav || {}, days: s.days || {}, tickets: s.tickets || {}, run: s.run || null, favDel: s.favDel || {}, resetAt: s.resetAt || 0, settings };
+  return { cards: s.cards || {}, fav: s.fav || {}, days: s.days || {}, tickets: s.tickets || {}, run: s.run || null, favDel: s.favDel || {}, resetAt: s.resetAt || 0, runTs: s.runTs || 0, settings };
 }
 const saveSettings = () => persist(backend.putKV('settings', S.settings));
 const saveFav = () => { touched(); return persist(Promise.all([backend.putKV('fav', S.fav), backend.putKV('favDel', S.favDel)])); };
 const saveTickets = () => { touched(); return persist(backend.putKV('tickets', S.tickets)); };
-const saveRun = () => persist(backend.putKV('run', S.run));
+const saveRun = () => {
+  S.runTs = Date.now();
+  touched();
+  return persist(Promise.all([backend.putKV('run', S.run), backend.putKV('runTs', S.runTs)]));
+};
 
 /* ---------- Helpers ---------- */
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -1033,6 +1038,7 @@ function normalizeSnapshot(x) {
   x = x || {};
   return {
     resetAt: x.resetAt || 0,
+    run: x.run || null, runTs: x.runTs || 0,
     reviews: Array.isArray(x.reviews) ? x.reviews.filter(r => Array.isArray(r) && r.length >= 3) : [],
     fav: x.fav || {}, favDel: x.favDel || {},
     tickets: x.tickets || {}, legacy: x.legacy || {}, days: x.days || {},
@@ -1045,7 +1051,7 @@ async function localSnapshot() {
   const inLog = new Set(reviews.map(r => r[0]));
   const legacy = {};
   Object.entries(S.cards).forEach(([id, c]) => { if (!inLog.has(id)) legacy[id] = c; });   // progress older than the log
-  return normalizeSnapshot({ resetAt: S.resetAt, reviews, fav: { ...S.fav }, favDel: { ...S.favDel }, tickets: S.tickets, legacy, days: { ...S.days } });
+  return normalizeSnapshot({ resetAt: S.resetAt, run: S.run, runTs: S.runTs, reviews, fav: { ...S.fav }, favDel: { ...S.favDel }, tickets: S.tickets, legacy, days: { ...S.days } });
 }
 
 function mergeSnapshots(a, b) {
@@ -1094,7 +1100,12 @@ function mergeSnapshots(a, b) {
     if (n) days[k] = n;
   });
 
-  return { resetAt, reviews, fav, favDel, tickets, legacy, days };
+  // Ticket in progress: the device that touched it last wins (its answers are in the log either way).
+  const runSrc = b.runTs > a.runTs ? b : a;
+  const runTs = Math.max(a.runTs, b.runTs);
+  const run = runTs > resetAt ? runSrc.run : null;
+
+  return { resetAt, reviews, fav, favDel, tickets, legacy, days, run, runTs };
 }
 
 // Card states for a snapshot: legacy cards plus a replay of the review log.
@@ -1109,7 +1120,7 @@ function replaySnapshot(m) {
   }
   return { cards, rows };
 }
-const snapshotKey = m => JSON.stringify([m.resetAt, m.reviews, m.fav, m.favDel, m.tickets, m.legacy, m.days]);
+const snapshotKey = m => JSON.stringify([m.resetAt, m.reviews, m.fav, m.favDel, m.tickets, m.legacy, m.days, m.run, m.runTs]);
 
 async function syncNow({ silent = false } = {}) {
   if (!syncCfg || !syncCfg.token) return false;
@@ -1135,7 +1146,7 @@ async function syncNow({ silent = false } = {}) {
         const { cards, rows } = replaySnapshot(merged);
         S.cards = cards; S.fav = merged.fav; S.favDel = merged.favDel; S.tickets = merged.tickets;
         S.days = merged.days; S.resetAt = merged.resetAt;
-        if (S.run && !S.run.done && merged.resetAt > (local.resetAt || 0)) S.run = null;
+        S.run = merged.run; S.runTs = merged.runTs;
         await backend.replace(S, rows);
         reviewsCount = rows.length;
       }
@@ -1154,6 +1165,14 @@ async function syncNow({ silent = false } = {}) {
         updatePill();
         const page = (location.hash || '#/study').split('/')[1];
         if (page === 'progress') renderProgress();
+        if (JSON.stringify(local.run) !== JSON.stringify(merged.run)) {
+          revealed = false; detailsOpen = S.settings.details; animateNext = true;
+          if (runActive()) {
+            ticketListOpen = false;
+            if (!silent || page === 'study') toast(ticketLabel(S.run.key) + ': продолжаю с вопроса ' + (S.run.i + 1) + ' из ' + S.run.ids.length);
+          }
+          if (page === 'study' && S.settings.view === 'tickets') { renderStudy(); window.scrollTo(0, 0); }
+        }
       }
       if (!silent) toast(changed ? 'Прогресс обновлён с другого устройства' : 'Синхронизировано');
       return true;
@@ -1195,7 +1214,7 @@ async function disconnectSync() {
 document.addEventListener('visibilitychange', () => {
   if (!syncCfg || !syncCfg.token) return;
   if (document.visibilityState === 'hidden') { if (syncTimer) syncNow({ silent: true }); }
-  else if (!syncCfg.last || Date.now() - syncCfg.last > 60e3) syncNow({ silent: true });
+  else if (!syncCfg.last || Date.now() - syncCfg.last > 5e3) syncNow({ silent: true });
 });
 window.addEventListener('online', () => syncNow({ silent: true }));
 
@@ -1412,7 +1431,8 @@ document.addEventListener('click', async e => {
   }
   if (d.act === 'reset') {
     confirmSheet('Сбросить прогресс?', 'Все уровни карточек, избранное, журнал ответов и статистика удалятся' + (syncCfg && syncCfg.token ? ', в том числе на других синхронизированных устройствах' : '') + '. Это нельзя отменить.', 'Сбросить', async () => {
-      S = { ...defaults(), settings: S.settings, resetAt: Date.now() };
+      const now = Date.now();
+      S = { ...defaults(), settings: S.settings, resetAt: now, runTs: now };
       await persist(backend.replace(S, []));
       reviewsCount = 0;
       touched();

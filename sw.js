@@ -1,7 +1,7 @@
 /* Service worker: makes the app work offline.
    Strategy: network first (so edits pushed to GitHub show up right away),
    falling back to the cache when offline or when the network is slow. */
-const CACHE = 'fe-cards-v8';
+const CACHE = 'fe-cards-v9';
 const ASSETS = [
   './',
   'index.html',
