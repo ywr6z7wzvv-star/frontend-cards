@@ -339,3 +339,63 @@ I break a task into pieces no bigger than a day (API, UI, states, tests), estima
 
 ## beh-tech-debt
 The planner is my main example: an outdated codebase, no tests, `any` everywhere. Instead of asking for a "refactoring sprint", I bundled improvements with features: whenever I touched a screen, I moved it to TanStack Query and covered it with tests. The big migration to React 19 and Next.js 16 happened without pausing feature work. And I backed it with numbers (the UI loads 30% faster, duplicate requests are gone) so the business could see the value.
+
+## nest-what
+On the healthcare portal, we built the BFF over Drupal on NestJS rather than plain Express, and the reason was the team, not speed. Eight frontend developers were going to touch this layer, and most of them had never written a backend. Nest gives one structure everyone follows: a module per CMS content type with a controller, a service and a mapper, DTOs with validation and Swagger generated from them. A new person could open any module and know where things are. With Express we would have had to invent and enforce that structure ourselves.
+
+**Takeaway:** Nest's value is the conventions (modules, DI, DTOs), which matter most when many people work on one codebase.
+
+## be-bff
+The main architecture change on the healthcare portal. The frontend lived inside the Drupal monolith, and components read raw CMS JSON: `field_*` names, nested `relationships`, the `included` array. When an editor renamed a field in the CMS, pages broke in several places at once. I proposed moving the frontend into a standalone Next.js app with a NestJS BFF between it and Drupal, and took part in designing it. The BFF maps CMS data into typed models, and one endpoint gives a page everything it needs (content, menu, related materials) instead of several calls from the browser. Now a CMS format change is fixed in one mapper in the BFF, and the UI doesn't notice.
+
+**Takeaway:** a BFF is a buffer: the source can change shape, and the frontend contract stays the same.
+
+## be-api-contracts
+On the healthcare portal, the CMS team changed the contract for user data, and the user account area depended on it end to end. I did the migration: new DTOs and mapping in the NestJS BFF plus the React client. The key was not to switch everything at once. For a while the BFF mapper accepted both the old and the new CMS format and returned the same response to the frontend, so the client could be updated separately and the old branch removed after the CMS fully switched. Users didn't see any breakage. The frontend types came from the BFF's Swagger spec, so every field change showed up as a TypeScript error in the client, not as a bug in production.
+
+**Takeaway:** expand and contract: support old and new formats for a while, then remove the old one.
+
+## nest-validation
+<!-- выдумано: детали пайпа и пример с телефоном -->
+In the account area BFF on the healthcare portal, every incoming body went through a global `ValidationPipe` with `whitelist: true` and `transform: true`, and DTOs used `class-validator`. `whitelist` mattered more than it looks: the profile form once started sending extra fields from the client state, and without it they would have gone straight to the CMS. On the client the same rules lived in Zod schemas for React Hook Form, so the user saw an error before the request, and the server still checked everything again.
+
+**Takeaway:** client validation is for UX, server validation is for safety. You need both.
+
+## nest-guards
+<!-- основа: резюме (ролевой доступ на хоккейной платформе), пример на Nest додуман -->
+On the hockey platform I built role-based access: admins, tournament organizers, referees and team representatives saw different modules and could do different things. Checks were on two levels: routes (a referee can't open the document review section) and actions (a team representative sees a protocol but can't confirm it). We kept one role-to-permission map, and both the UI and the backend checked against it. Hiding a button is only for convenience, and the real check is on the server. In NestJS this is exactly a guard: a `@Roles()` decorator on the handler and a `RolesGuard` that reads it through `Reflector` and compares it with the user's roles from the session.
+
+## be-monolith-microservices
+The healthcare portal is my example of a careful split. The frontend left the Drupal monolith, but we didn't cut it into dozens of services. The Next.js app, the UI kit and the styles became separate packages in a private npm registry, and the visually impaired mode was a separate micro-frontend because it had its own release cycle and requirements. The cost showed up quickly: changing a button meant releasing the UI kit and then bumping its version in every app. So we split out only parts with a real reason to live separately, and kept the rest together.
+
+**Takeaway:** split where release cycles or owners really differ. Otherwise you pay for the split with versioning and coordination.
+
+## docker-multistage
+When I moved static assets to a CDN on the healthcare portal, the Dockerfile changed too. The build stage builds Next.js, and the deploy script uploads `.next/static` with hashed file names to the CDN. The runtime stage gets only what the server needs to run, so images and static files are no longer served by the Node containers. Over 95% of outgoing traffic moved off the frontend service, about 17 TB a year, and the image got lighter.
+
+**Takeaway:** the final stage should contain only what the running process needs. Everything else stays in the build stage or goes elsewhere (CDN).
+
+## docker-dockerfile
+<!-- выдумано -->
+When reviewing Dockerfiles on the healthcare portal, I kept seeing two mistakes. The first: `COPY . .` before `npm ci`, so any change in the code invalidated the dependency layer and every CI build reinstalled packages from scratch. Moving `package*.json` and `npm ci` above the source copy cut the build time noticeably. The second: `CMD npm start`. With it, `SIGTERM` during a rollout didn't reach Node, the container was killed after the timeout, and some requests failed. The exec form `CMD ["node", "server.js"]` fixed it.
+
+## be-caching
+CDN caching on the healthcare portal is the clearest example. Next.js puts a content hash in static file names, so a file with a given name never changes. These files got `Cache-Control: public, max-age=31536000, immutable`: the browser and the CDN keep them for a year and don't even revalidate. HTML stayed `no-cache` with revalidation, so a new deploy is visible right away: new HTML points to new file names. There's no invalidation problem here at all, because the name changes with the content.
+
+**Takeaway:** the easiest cache to invalidate is one you never need to invalidate: put the version in the file name.
+
+## sql-pagination
+On the hockey platform, the catalog page weighed 26–28 MB: the PHP backend sent all records at once, and filtering happened on the client. I rebuilt it with pagination on the server and moved filter options to a separate endpoint, so the page loads one page of results and the filter list separately. Public pages had to stay indexed, so I kept regular page numbers in the URL (`?page=3`) rendered on the server, not infinite scroll. LCP went from 2.8 to 0.5 s, FCP from 2.3 to 0.3 s, and Lighthouse from 39 to 78. Here `OFFSET` was fine: the catalog is a few thousand rows. On a table with millions of rows I would use keyset pagination.
+
+## sql-indexes
+<!-- выдумано: индекс и цифры запроса -->
+After moving the hockey platform catalog to server-side pagination, the next bottleneck was the database: filtering players by tournament and season with sorting did a full table scan. `EXPLAIN` showed a `Seq Scan` on the players table. A composite index on the filter columns plus the sort column turned it into an `Index Scan`, and the query went from hundreds of milliseconds to a few. I always check with `EXPLAIN ANALYZE` that the index is actually used, instead of adding indexes "just in case".
+
+## node-errors
+In my ru-a11y-toolkit, the CLI that audits pages in CI has separate exit codes: `0` means no violations, `1` means the audit found accessibility problems, and `2` means the audit couldn't run at all (the page didn't open, Chromium crashed, the config is broken). Without this, CI can't tell "the site has a11y issues" from "the tool is broken", and people start ignoring red builds. In the code, expected errors (a page failed to load) are caught and go to the report, unexpected ones go up to a top-level handler that prints a clear message and sets `process.exitCode = 2`. I use `exitCode` instead of `process.exit()` so the HTML and JUnit reports have time to be written.
+
+**Takeaway:** a CLI's exit codes are its API for CI. Different failure types need different codes.
+
+## node-threads
+<!-- основа: резюме (CLI на Puppeteer), детали про параллельность додуманы -->
+The ru-a11y-toolkit CLI audits many pages, and at first I thought about worker threads to speed it up. Then I looked at where the time goes: the heavy work happens in Chromium, which is a separate process anyway, and Node mostly waits for it. So the answer was not threads, but limited concurrency: several pages open in parallel through a small queue (about 4 at a time), so the machine doesn't run out of memory. Worker threads are for CPU work in JavaScript itself, and here there wasn't any.

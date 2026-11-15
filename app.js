@@ -35,7 +35,7 @@ function defaults() {
     favDel: {},     // question id -> time it was removed from favorites (for sync)
     resetAt: 0,     // time of the last "reset progress" (for sync)
     runTs: 0,       // time of the last change to the ticket in progress (for sync)
-    settings: { theme: 'auto', details: false, exp: true, onlyExp: false, goal: 20, mode: 'smart', cats: null, view: 'cards', lang: 'en' },
+    settings: { theme: 'auto', details: false, exp: true, onlyExp: false, goal: 20, mode: 'smart', cats: null, view: 'cards', lang: 'en', off: ['vue'], knownCats: null },
   };
 }
 let S = defaults();
@@ -197,11 +197,23 @@ async function backfillStreaks() {
   await persist(backend.putCards(changed));
 }
 
+// Topics that existed before topics could be switched off (used to find new ones).
+const ORIGINAL_CATS = ['js', 'css', 'react', 'vue', 'general', 'ts', 'perf', 'browser', 'security', 'architecture', 'testing', 'a11y', 'tooling', 'behavioral'];
+// Switched-off topics are left out of studying and tickets, but stay in the catalog and search.
+const isOn = cat => !S.settings.off.includes(cat);
+const onCats = () => DATA.cats.filter(c => isOn(c.id));
+const onQS = () => QS.filter(q => isOn(q.cat));
 function mergeState(s) {
   const d = defaults();
   const settings = { ...d.settings, ...(s.settings || {}) };
   const allCats = DATA.cats.map(c => c.id);
-  settings.cats = Array.isArray(settings.cats) ? settings.cats.filter(c => allCats.includes(c)) : allCats;
+  // Topics added in an update join the deck automatically.
+  const known = Array.isArray(settings.knownCats) ? settings.knownCats : ORIGINAL_CATS;
+  const fresh = allCats.filter(c => !known.includes(c));
+  const cats = Array.isArray(settings.cats) ? settings.cats.filter(c => allCats.includes(c)) : allCats;
+  settings.cats = [...new Set([...cats, ...fresh])];
+  settings.knownCats = allCats;
+  settings.off = Array.isArray(settings.off) ? settings.off.filter(c => allCats.includes(c)) : ['vue'];
   return { cards: s.cards || {}, fav: s.fav || {}, days: s.days || {}, tickets: s.tickets || {}, run: s.run || null, favDel: s.favDel || {}, resetAt: s.resetAt || 0, runTs: s.runTs || 0, settings };
 }
 const saveSettings = () => persist(backend.putKV('settings', S.settings));
@@ -292,7 +304,7 @@ function isWeak(id) {
 }
 function pool() {
   const cats = new Set(S.settings.cats);
-  let list = QS.filter(q => cats.has(q.cat));
+  let list = QS.filter(q => cats.has(q.cat) && isOn(q.cat));
   if (S.settings.onlyExp) list = list.filter(q => EXP[q.id]);
   const mode = S.settings.mode;
   if (mode === 'weak') list = list.filter(q => isWeak(q.id));
@@ -482,6 +494,17 @@ const RU_TERMS = {
   'ревью': 'review', 'ментор': 'mentor', 'оценк': 'estimat', 'дедлайн': 'deadline', 'техдолг': 'technical debt',
   'долг': 'debt', 'несоглас': 'disagree', 'конфликт': 'disagree', 'проект': 'project', 'ошибк': 'error',
   'обработк': 'handl', 'отмен': 'cancel', 'наблюдат': 'observer', 'интернационал': 'i18n', 'перевод': 'i18n',
+  'индекс': 'index', 'транзакц': 'transaction', 'миграц': 'migration', 'контейнер': 'container', 'образ': 'image',
+  'очеред': 'queue', 'брокер': 'broker', 'нода': 'node', 'ноде': 'node', 'нест': 'nest', 'докер': 'docker',
+  'кубер': 'kubernetes', 'пагинац': 'pagination', 'блокировк': 'lock', 'дедлок': 'deadlock', 'репликац': 'replication',
+  'шардир': 'shard', 'партиц': 'partition', 'представлен': 'view', 'изоляц': 'isolation', 'внедрен': 'injection',
+  'зависимост': 'dependenc', 'нормализ': 'normaliz', 'сесси': 'session', 'идемпотент': 'idempot',
+  'микросервис': 'microservice', 'монолит': 'monolith', 'поток': 'stream', 'стрим': 'stream', 'буфер': 'buffer',
+  'база': 'database', 'базы': 'database', 'базе': 'database', 'постгр': 'postgres', 'джоин': 'join',
+  'вакуум': 'vacuum', 'проба': 'probe', 'пробы': 'probe', 'секрет': 'secret', 'масштаб': 'scal', 'логир': 'logging',
+  'метрик': 'metric', 'трассир': 'trac', 'пул': 'pool', 'деньг': 'money', 'гард': 'guard', 'перехватчик': 'interceptor',
+  'пайп': 'pipe', 'декоратор': 'decorator', 'модул': 'module', 'абстракт': 'abstract', 'кластер': 'cluster',
+  'лимит': 'limit', 'ограничен': 'limit constraint', 'деплой': 'deploy', 'сага': 'saga', 'аутентиф': 'authentication',
 };
 const RU_LAYOUT = 'йцукенгшщзхъфывапролджэячсмитьбю.ё';
 const EN_LAYOUT = "qwertyuiop[]asdfghjkl;'zxcvbnm,./`";
@@ -612,10 +635,10 @@ function renderStudy() {
   }
   const today = S.days[dayKey()] || 0, goal = S.settings.goal;
   const modes = [['smart', 'Умный'], ['random', 'Случайно'], ['weak', 'Слабые'], ['fav', 'Избранное']];
-  const selCats = S.settings.cats.length;
+  const selCats = S.settings.cats.filter(isOn).length, allOn = onCats().length;
   let h = VIEW_SWITCH() + '<div class="toolbar"><div class="seg full" role="group" aria-label="Режим">' +
     modes.map(([m, l]) => '<button data-mode="' + m + '" aria-pressed="' + (S.settings.mode === m) + '">' + l + '</button>').join('') + '</div></div>';
-  h += '<div class="session"><button class="chip" data-open="cats">Темы: ' + (selCats === DATA.cats.length ? 'все' : selCats + ' из ' + DATA.cats.length) + (S.settings.onlyExp ? ' · 💼' : '') + ' ▾</button>' +
+  h += '<div class="session"><button class="chip" data-open="cats">Темы: ' + (selCats === allOn ? 'все' : selCats + ' из ' + allOn) + (S.settings.onlyExp ? ' · 💼' : '') + ' ▾</button>' +
     '<span>' + today + ' / ' + goal + '</span><div class="goalbar" title="Цель на день"><div style="width:' + Math.min(100, today / goal * 100) + '%"></div></div><span>' + pool().length + ' в колоде</span></div>';
   if (!current) {
     const msg = S.settings.mode === 'fav' ? ['Избранное пусто', 'Отмечай сложные вопросы звёздочкой, чтобы гонять их отдельно.']
@@ -644,6 +667,7 @@ function nextCard() {
    A ticket is passed only when every answer is "Знал". */
 const TICKET_SIZE = 20;
 let TICKETS = [];           // [[question id, ...], ...]; ticket number = index + 1
+let DEAL = '';              // fingerprint of the current deal of questions into tickets
 let ticketListOpen = false; // show the list even though a ticket is in progress
 function hash(str) {
   let h = 2166136261;
@@ -651,12 +675,22 @@ function hash(str) {
   return h >>> 0;
 }
 function buildTickets() {
-  const n = Math.max(1, Math.round(QS.length / TICKET_SIZE));
+  const qs = onQS();
+  const n = Math.max(1, Math.round(qs.length / TICKET_SIZE));
   const out = Array.from({ length: n }, () => []);
   let k = 0;
-  DATA.cats.forEach(c => QS.filter(q => q.cat === c.id).sort((a, b) => hash(a.id) - hash(b.id)).forEach(q => out[k++ % n].push(q.id)));
-  return out.map((ids, i) => ids.sort((a, b) => hash(a + '#' + i) - hash(b + '#' + i))); // mix topics inside a ticket
+  onCats().forEach(c => qs.filter(q => q.cat === c.id).sort((a, b) => hash(a.id) - hash(b.id)).forEach(q => out[k++ % n].push(q.id)));
+  const tickets = out.map((ids, i) => ids.sort((a, b) => hash(a + '#' + i) - hash(b + '#' + i))); // mix topics inside a ticket
+  DEAL = hash(tickets.map(t => t.join(',')).join('|')).toString(36);
+  return tickets;
 }
+// Ticket results count only for the current deal: new questions or topic switches reshuffle tickets.
+function statsFor(key) { const t = S.tickets[key]; return t && t.deal === DEAL ? t : null; }
+function runIsCurrent(run) {
+  const ids = typeof run.key === 'number' && TICKETS[run.key - 1];
+  return !!ids && ids.join() === run.ids.join();
+}
+function runLabel(run) { return run.key === 'errors' ? 'Работа над ошибками' : runIsCurrent(run) ? 'Билет ' + run.key : 'Прошлый билет'; }
 // Questions answered wrong in the latest attempt of any ticket.
 function ticketMistakes() {
   const set = new Set();
@@ -668,7 +702,7 @@ function runActive() { return S.run && !S.run.done; }
 
 function startTicket(key, force) {
   if (!force && runActive() && S.run.i > 0 && S.run.key !== key) {
-    confirmSheet('Бросить ' + ticketLabel(S.run.key).toLowerCase() + '?', 'Пройдено ' + S.run.i + ' из ' + S.run.ids.length + '. Ответы уже засчитаны в прогресс карточек, но билет не будет завершён.', 'Начать другой', () => startTicket(key, true));
+    confirmSheet('Бросить ' + runLabel(S.run).toLowerCase() + '?', 'Пройдено ' + S.run.i + ' из ' + S.run.ids.length + '. Ответы уже засчитаны в прогресс карточек, но билет не будет завершён.', 'Начать другой', () => startTicket(key, true));
     return;
   }
   const ids = key === 'errors' ? shuffle(ticketMistakes()) : (TICKETS[key - 1] || []).filter(id => BY_ID[id]);
@@ -679,13 +713,13 @@ function startTicket(key, force) {
 }
 function nextTicketKey(after = 0) {
   const n = TICKETS.length;
-  for (let k = 1; k <= n; k++) { const key = (after + k - 1) % n + 1; if (!(S.tickets[key] || {}).passed) return key; }
+  for (let k = 1; k <= n; k++) { const key = (after + k - 1) % n + 1; if (!(statsFor(key) || {}).passed) return key; }
   return after % n + 1;
 }
 function randomTicketKey() {
   const keys = TICKETS.map((_, i) => i + 1);
-  const fresh = keys.filter(k => !S.tickets[k]);
-  const open = keys.filter(k => !(S.tickets[k] || {}).passed);
+  const fresh = keys.filter(k => !statsFor(k));
+  const open = keys.filter(k => !(statsFor(k) || {}).passed);
   const from = fresh.length ? fresh : open.length ? open : keys;
   return from[Math.floor(Math.random() * from.length)];
 }
@@ -708,9 +742,9 @@ function ticketAnswer(g) {
 function finishTicket() {
   const run = S.run;
   run.done = true;
-  if (run.key === 'errors') return;
+  if (!runIsCurrent(run)) return;   // the errors drill, or a ticket from an older deal
   const ok = run.answers.filter(g => g === 2).length;
-  const prev = S.tickets[run.key] || { attempts: 0, best: 0, passed: false };
+  const prev = statsFor(run.key) || { attempts: 0, best: 0, passed: false };
   S.tickets[run.key] = {
     attempts: prev.attempts + 1,
     best: Math.max(prev.best, ok),
@@ -718,6 +752,7 @@ function finishTicket() {
     size: run.ids.length,
     passed: prev.passed || ok === run.ids.length,
     ts: Date.now(),
+    deal: DEAL,
     mistakes: run.ids.filter((id, i) => run.answers[i] !== 2),
   };
   saveTickets();
@@ -726,17 +761,17 @@ function finishTicket() {
 function renderTickets() {
   if (runActive() && !ticketListOpen) return renderTicketRun();
   if (S.run && S.run.done && !ticketListOpen) return renderTicketResult();
-  const passed = TICKETS.filter((_, i) => (S.tickets[i + 1] || {}).passed).length;
+  const passed = TICKETS.filter((_, i) => (statsFor(i + 1) || {}).passed).length;
   const errors = ticketMistakes().length;
   let h = VIEW_SWITCH();
   if (runActive()) {
-    h += '<button class="btn primary block tk-continue" data-act="tcontinue">Продолжить: ' + ticketLabel(S.run.key) + ' · ' + S.run.i + ' из ' + S.run.ids.length + '</button>';
+    h += '<button class="btn primary block tk-continue" data-act="tcontinue">Продолжить: ' + runLabel(S.run) + ' · ' + S.run.i + ' из ' + S.run.ids.length + '</button>';
   }
   h += '<div class="tk-actions"><button class="btn" data-act="tnext">Следующий билет</button><button class="btn" data-act="trandom">Случайный</button>' +
     '<button class="btn' + (errors ? ' danger' : '') + '" data-act="terrors"' + (errors ? '' : ' disabled') + '>Работа над ошибками · ' + errors + '</button></div>';
-  h += '<p class="count-line">Сдано ' + passed + ' из ' + TICKETS.length + '. В билете ~' + TICKET_SIZE + ' вопросов из всех тем. Сдан — только если на всё ответил «Знал».</p>';
+  h += '<p class="count-line">Сдано ' + passed + ' из ' + TICKETS.length + '. В билете ~' + TICKET_SIZE + ' вопросов из включённых тем. Сдан — только если на всё ответил «Знал».</p>';
   h += '<div class="tk-grid">' + TICKETS.map((ids, i) => {
-    const key = i + 1, t = S.tickets[key], live = runActive() && S.run.key === key;
+    const key = i + 1, t = statsFor(key), live = runActive() && runIsCurrent(S.run) && S.run.key === key;
     let cls = 'tk', sub;
     if (live) { cls += ' progress'; sub = S.run.i + '/' + ids.length + '…'; }
     else if (t) { cls += t.passed ? ' passed' : ' failed'; sub = t.last + '/' + (t.size || ids.length) + (t.passed ? ' ✓' : ''); }
@@ -755,7 +790,7 @@ function renderTicketRun() {
   const run = S.run, q = BY_ID[run.ids[run.i]];
   if (!q) { run.i++; if (run.i >= run.ids.length) finishTicket(); saveRun(); return renderStudy(); }
   view.innerHTML = VIEW_SWITCH() +
-    '<div class="tk-head"><button class="back" data-act="tlist">‹ Билеты</button><span>' + ticketLabel(run.key) + ' · ' + (run.i + 1) + ' из ' + run.ids.length + '</span></div>' +
+    '<div class="tk-head"><button class="back" data-act="tlist">‹ Билеты</button><span>' + runLabel(run) + ' · ' + (run.i + 1) + ' из ' + run.ids.length + '</span></div>' +
     runDots(run) + questionArticle(q, true);
 }
 function renderTicketResult() {
@@ -763,9 +798,9 @@ function renderTicketResult() {
   const cnt = g => run.answers.filter(x => x === g).length;
   const ok = cnt(2), errors = run.key === 'errors';
   const passed = ok === n;
-  const t = S.tickets[run.key];
+  const t = runIsCurrent(run) ? statsFor(run.key) : null;
   let h = VIEW_SWITCH() + '<div class="card tk-result ' + (passed ? 'passed' : 'failed') + '">' +
-    '<div class="tk-result-title">' + ticketLabel(run.key) + (errors ? ' — готово' : passed ? ' — сдан ✓' : ' — не сдан') + '</div>' +
+    '<div class="tk-result-title">' + runLabel(run) + (errors ? ' — готово' : passed ? ' — сдан ✓' : ' — не сдан') + '</div>' +
     '<div class="tk-score"><b>' + ok + '</b> / ' + n + '</div>' +
     '<p class="count-line">Знал ' + ok + ' · Сомневался ' + cnt(1) + ' · Не знал ' + cnt(0) + '</p>' +
     (t && !errors ? '<p class="count-line">Лучший результат ' + t.best + '/' + n + ' · попыток ' + t.attempts + '</p>' : '') +
@@ -887,13 +922,14 @@ function renderDetail(id) {
 
 function renderProgress() {
   const counts = { new: 0, weak: 0, learning: 0, learned: 0 };
-  QS.forEach(q => counts[status(q.id)]++);
+  const qsOn = onQS();
+  qsOn.forEach(q => counts[status(q.id)]++);
   let reviews = 0, ok = 0, fail = 0;
   Object.values(S.cards).forEach(c => { reviews += c.seen; ok += c.ok; fail += c.fail; });
   const acc = ok + fail ? Math.round(ok / (ok + fail) * 100) + '%' : '—';
-  const pct = n => (n / QS.length * 100) + '%';
+  const pct = n => (n / qsOn.length * 100) + '%';
   let h = '<div class="stats">' +
-    '<div class="stat"><b>' + counts.learned + '</b><span>выучено из ' + QS.length + '</span></div>' +
+    '<div class="stat"><b>' + counts.learned + '</b><span>выучено из ' + qsOn.length + '</span></div>' +
     '<div class="stat"><b>' + streak() + '</b><span>' + plural(streak(), 'день', 'дня', 'дней') + ' подряд</span></div>' +
     '<div class="stat"><b>' + reviews + '</b><span>всего повторений</span></div>' +
     '<div class="stat"><b>' + acc + '</b><span>ответов «Знал»</span></div></div>';
@@ -905,7 +941,7 @@ function renderProgress() {
   const max = Math.max(1, ...vals);
   vals.forEach(v => { h += '<div class="' + (v ? '' : 'zero') + '" style="height:' + Math.max(4, v / max * 100) + '%" title="' + v + '"></div>'; });
   h += '</div></div><div class="section-title">По темам</div><div class="card">';
-  DATA.cats.forEach(cat => {
+  onCats().forEach(cat => {
     const qs = QS.filter(q => q.cat === cat.id), n = qs.length;
     const c = { weak: 0, learning: 0, learned: 0 };
     qs.forEach(q => { const s = status(q.id); if (s in c) c[s]++; });
@@ -940,6 +976,9 @@ function renderSettings() {
     '<div class="setting"><div class="l">Сразу показывать подробный ответ<small>Иначе сначала только short answer</small></div><button class="switch" role="switch" data-toggle="details" aria-checked="' + S.settings.details + '" aria-label="Подробный ответ"></button></div>' +
     '<div class="setting"><div class="l">Показывать истории из опыта<small>Блок «From my experience» под ответом</small></div><button class="switch" role="switch" data-toggle="exp" aria-checked="' + S.settings.exp + '" aria-label="Истории из опыта"></button></div>' +
     '</div>' +
+    '<div class="section-title">Темы</div><div class="card"><p class="count-line">Выключенные темы не попадают в «Учить» и в билеты, но остаются в каталоге и поиске на «Собесе».</p>' +
+    DATA.cats.map(c => '<div class="setting"><div class="l">' + esc(c.name) + '<small>' + CAT_COUNT[c.id] + ' ' + plural(CAT_COUNT[c.id], 'вопрос', 'вопроса', 'вопросов') + '</small></div>' +
+      '<button class="switch" role="switch" data-topic="' + c.id + '" aria-checked="' + isOn(c.id) + '" aria-label="' + esc(c.name) + '"></button></div>').join('') + '</div>' +
     '<div class="section-title">Как это работает</div><div class="card md"><p>Каждая карточка живёт в одной из 5 «коробок». <strong>Знал</strong> переносит её выше, и она возвращается всё реже: через 15 минут, день, 3, 7 и 16 дней. <strong>Сомневался</strong> откладывает ненадолго. <strong>Не знал</strong> отправляет в начало, и карточка вернётся через минуту.</p><p>Режим <strong>Умный</strong> сначала даёт карточки, которые пора повторить, потом новые. <strong>Слабые</strong> гоняет вопросы, где ты хоть раз ответил «Не знал» или «Сомневался»; вопрос уходит оттуда только после 3 «Знал» подряд. Карточка считается выученной с 3-й коробки.</p></div>' +
     '<div class="section-title">Хранилище</div><div class="card"><p class="count-line">' +
     (backend === idb ? 'IndexedDB' : 'localStorage (IndexedDB недоступна)') + ' · ' +
@@ -1169,7 +1208,7 @@ async function syncNow({ silent = false } = {}) {
           revealed = false; detailsOpen = S.settings.details; animateNext = true;
           if (runActive()) {
             ticketListOpen = false;
-            if (!silent || page === 'study') toast(ticketLabel(S.run.key) + ': продолжаю с вопроса ' + (S.run.i + 1) + ' из ' + S.run.ids.length);
+            if (!silent || page === 'study') toast(runLabel(S.run) + ': продолжаю с вопроса ' + (S.run.i + 1) + ' из ' + S.run.ids.length);
           }
           if (page === 'study' && S.settings.view === 'tickets') { renderStudy(); window.scrollTo(0, 0); }
         }
@@ -1257,23 +1296,27 @@ function openSheet(html, onClick) {
   const f = ov.querySelector('button'); if (f) f.focus();
   return ov;
 }
+const PRESETS = {
+  front: ['js', 'ts', 'css', 'react', 'vue', 'perf', 'browser', 'a11y', 'tooling', 'testing'],
+  back: ['node', 'nest', 'sql', 'devops', 'backend', 'security', 'architecture', 'ts', 'testing'],
+};
 function catSheetHtml() {
   const sel = new Set(S.settings.cats);
   const expCount = QS.filter(q => EXP[q.id]).length;
   return '<h3>Темы для тренировки</h3><div class="sub">Выбранные темы попадают в колоду.</div>' +
-    '<div class="sheet-actions"><button class="btn" data-preset="all">Все</button><button class="btn" data-preset="base">Базовые</button><button class="btn" data-preset="senior">Senior-темы</button><button class="btn" data-preset="none">Снять все</button></div>' +
+    '<div class="sheet-actions"><button class="btn" data-preset="all">Все</button><button class="btn" data-preset="front">Фронтенд</button><button class="btn" data-preset="back">Бэкенд</button><button class="btn" data-preset="none">Снять все</button></div>' +
     '<button class="check" role="checkbox" data-only-exp aria-checked="' + S.settings.onlyExp + '"><span class="box">' + ICON_CHECK + '</span><span class="name">💼 Только вопросы с историей из опыта</span><span class="num">' + expCount + '</span></button>' +
-    DATA.cats.map(c => '<button class="check" role="checkbox" data-cat-toggle="' + c.id + '" aria-checked="' + sel.has(c.id) + '"><span class="box">' + ICON_CHECK + '</span><span class="name">' + esc(c.name) + '</span><span class="num">' + CAT_COUNT[c.id] + '</span></button>').join('') +
+    onCats().map(c => '<button class="check" role="checkbox" data-cat-toggle="' + c.id + '" aria-checked="' + sel.has(c.id) + '"><span class="box">' + ICON_CHECK + '</span><span class="name">' + esc(c.name) + '</span><span class="num">' + CAT_COUNT[c.id] + '</span></button>').join('') +
+    (onCats().length < DATA.cats.length ? '<p class="count-line">Остальные темы выключены в Настройках → «Темы».</p>' : '') +
     '<div style="margin-top:14px"><button class="btn primary block" data-done>Готово</button></div>';
 }
 function openCats() {
   const ov = openSheet(catSheetHtml(), (e, close) => {
     const t = e.target.closest('button'); if (!t) return;
     if (t.dataset.done !== undefined) { close(); current = null; renderStudy(); return; }
-    const base = ['js', 'css', 'react', 'vue', 'general'];
     if (t.dataset.preset) {
-      const p = t.dataset.preset, all = DATA.cats.map(c => c.id);
-      S.settings.cats = p === 'all' ? all : p === 'base' ? base : p === 'senior' ? all.filter(c => !base.includes(c)) : [];
+      const p = t.dataset.preset, all = onCats().map(c => c.id);
+      S.settings.cats = p === 'all' ? all : p === 'none' ? [] : all.filter(c => PRESETS[p].includes(c));
     }
     if (t.dataset.onlyExp !== undefined) S.settings.onlyExp = !S.settings.onlyExp;
     if (t.dataset.catToggle) {
@@ -1339,7 +1382,7 @@ document.addEventListener('click', async e => {
   if (d.view) { S.settings.view = d.view; saveSettings(); ticketListOpen = true; renderStudy(); return; }
   if (d.ticket) {
     const key = +d.ticket;
-    if (runActive() && S.run.key === key) { ticketListOpen = false; renderStudy(); window.scrollTo(0, 0); }
+    if (runActive() && runIsCurrent(S.run) && S.run.key === key) { ticketListOpen = false; renderStudy(); window.scrollTo(0, 0); }
     else startTicket(key);
     return;
   }
@@ -1374,6 +1417,16 @@ document.addEventListener('click', async e => {
   if (d.act === 'back') { if (history.length > 1) history.back(); else location.hash = '#/catalog'; return; }
   if (d.themeSet) { S.settings.theme = d.themeSet; saveSettings(); applyTheme(); renderSettings(); return; }
   if (d.goal) { S.settings.goal = +d.goal; saveSettings(); renderSettings(); return; }
+  if (d.topic) {
+    const off = new Set(S.settings.off);
+    off.has(d.topic) ? off.delete(d.topic) : off.add(d.topic);
+    if (off.size === DATA.cats.length) { toast('Хотя бы одна тема должна остаться'); return; }
+    S.settings.off = DATA.cats.map(c => c.id).filter(c => off.has(c));
+    if (!off.has(d.topic) && !S.settings.cats.includes(d.topic)) S.settings.cats = [...S.settings.cats, d.topic];
+    saveSettings(); TICKETS = buildTickets(); current = null;
+    const y = window.scrollY; renderSettings(); window.scrollTo(0, y);
+    return;
+  }
   if (d.toggle === 'details' || d.toggle === 'exp') { S.settings[d.toggle] = !S.settings[d.toggle]; saveSettings(); renderSettings(); return; }
   if (d.act === 'export') {
     let code = '';
@@ -1490,6 +1543,7 @@ async function boot() {
     return;
   }
   await initStorage();
+  TICKETS = buildTickets();
   applyTheme();
   updatePill();
   updateLang();

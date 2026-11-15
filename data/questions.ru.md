@@ -5934,3 +5934,1767 @@ repo/
 - **Обоснование для бизнеса**: «Переход на новую библиотеку форм сократит время разработки форм примерно на 40%, а мы делаем около 3 форм за спринт».
 - **Выполнять постепенно**: паттерн strangler, codemods, правила линтера, запрещающие новые использования устаревших паттернов, фича-флаги.
 - Отмечай и рассказывай об улучшениях, чтобы инвестиции в качество и дальше поддерживались.
+
+## ts-abstract-interface
+Чем абстрактный класс отличается от интерфейса и когда что использовать?
+--- short
+**Интерфейс** описывает только **контракт**: какие методы и свойства должны быть у объекта, без реализации и без кода во время выполнения (в TypeScript он исчезает после компиляции). Класс может реализовать много интерфейсов. **Абстрактный класс** — базовый класс, в котором могут быть и **реализованные** методы, и **абстрактные**, которые обязаны реализовать наследники; у него может быть конструктор и состояние, а создать его экземпляр напрямую нельзя. Класс может наследовать только один абстрактный класс. Интерфейс — для «что он умеет», абстрактный класс — для «семейства с общим поведением».
+--- details
+```ts
+interface PaymentGateway {
+  charge(amount: number, currency: string): Promise<string>;
+}
+
+abstract class BaseRepository<T> {
+  constructor(protected readonly db: DataSource) {}
+  abstract tableName: string;                       // subclasses must define it
+  findById(id: string): Promise<T | null> {          // shared implementation
+    return this.db.query(`SELECT * FROM ${this.tableName} WHERE id = $1`, [id]);
+  }
+}
+
+class StripeGateway implements PaymentGateway { /* ... */ }
+class UsersRepository extends BaseRepository<User> { tableName = 'users'; }
+```
+
+Почему нельзя создать экземпляр абстрактного класса: он намеренно незавершён — у некоторых методов нет тела, поэтому такой объект не смог бы работать. `new BaseRepository()` — ошибка компиляции.
+
+Практические заметки по TypeScript:
+- Интерфейсов нет во время выполнения, поэтому в DI NestJS нельзя внедрить зависимость по типу интерфейса; используют токен (`@Inject('PAYMENT_GATEWAY')`) или абстрактный класс как токен (абстрактные классы во время выполнения существуют).
+- Для контрактов между модулями предпочитай интерфейсы и композицию; абстрактные классы — когда несколько реализаций действительно делят код (паттерн «шаблонный метод»).
+- Глубокие иерархии классов становятся хрупкими; держи наследование неглубоким.
+
+## node-what
+Что такое Node.js и как один поток обрабатывает тысячи запросов?
+--- short
+Node.js — среда выполнения JavaScript на движке V8 из Chrome плюс **libuv**, библиотека на C для асинхронного ввода-вывода. Твой JavaScript выполняется в **одном основном потоке**, а ввод-вывод (сеть, файлы, база данных) отдаётся операционной системе или небольшому пулу потоков. Пока запрос ждёт ответа базы, поток свободен и обрабатывает другие запросы. Когда результат готов, его колбэк ставится в очередь, и event loop его выполняет.
+--- details
+Почему это хорошо подходит для веб-бэкенда: большая часть типичного запроса — это **ожидание** (база, другие API, диск), а не вычисления. Node не блокирует отдельный поток на каждый запрос, как классическая модель «поток на запрос». Он держит один поток занятым короткими кусками JavaScript между ожиданиями.
+
+```js
+import http from 'node:http';
+
+http.createServer(async (req, res) => {
+  const user = await db.findUser(1);   // the thread is free while the DB answers
+  res.end(JSON.stringify(user));
+}).listen(3000);
+```
+
+Где ему тяжело: **вычисления на CPU** (обработка изображений, разбор огромного JSON, криптография в цикле, тяжёлые отчёты). Пока JavaScript считает, единственный поток никого больше не обслуживает. Решения: `worker_threads`, вынос работы в отдельный сервис или очередь, несколько процессов (cluster, несколько подов).
+
+Хорошие применения: API и BFF, приложения реального времени (WebSocket), стриминг, CLI и инструменты. Хуже подходит: тяжёлая математика.
+
+## node-event-loop
+Какие фазы есть у event loop в Node.js?
+--- short
+Event loop в Node.js проходит фазы по кругу: **timers** (колбэки `setTimeout`/`setInterval`), **pending callbacks** (некоторые системные ошибки), **poll** (ждёт новый ввод-вывод и выполняет его колбэки), **check** (колбэки `setImmediate`) и **close callbacks** (`socket.on('close')`). Между любыми колбэками Node сначала выполняет все `process.nextTick`, а затем микрозадачи промисов.
+--- details
+```
+   ┌──────────────┐
+┌─>│    timers     │  setTimeout, setInterval
+│  ├──────────────┤
+│  │pending callbacks│ deferred system errors
+│  ├──────────────┤
+│  │     poll      │  new I/O events; waits here if nothing else to do
+│  ├──────────────┤
+│  │     check     │  setImmediate
+│  ├──────────────┤
+└──┤close callbacks│  'close' events
+   └──────────────┘
+```
+
+Что стоит сказать:
+- Цикл — не часть JavaScript, его даёт **libuv**. В браузере свой event loop с другими правилами.
+- **Микрозадачи** (сначала `process.nextTick`, потом промисы) выполняются после каждого колбэка, а не только между фазами.
+- Внутри колбэка ввода-вывода `setImmediate` всегда срабатывает раньше `setTimeout(fn, 0)`, потому что фаза check идёт сразу после poll. Из основного модуля порядок этих двух не гарантирован.
+- Если один колбэк выполняется 2 секунды, **всё** ждёт 2 секунды: другие запросы, таймеры, health check-и. Это «event loop lag», главная проблема производительности, за которой нужно следить в Node.
+
+## node-nexttick
+В чём разница между `process.nextTick`, `setImmediate` и промисами?
+--- short
+`process.nextTick` выполняется **сразу после текущей операции**, раньше любых других микрозадач и ввода-вывода. Затем идут колбэки промисов (`.then`, код после `await`) как микрозадачи. `setImmediate` выполняется в фазе **check** следующей итерации цикла, после ввода-вывода. Порядок: синхронный код → `nextTick` → промисы → таймеры, ввод-вывод, `setImmediate`.
+--- details
+```js
+setImmediate(() => console.log('immediate'));
+setTimeout(() => console.log('timeout'), 0);
+Promise.resolve().then(() => console.log('promise'));
+process.nextTick(() => console.log('nextTick'));
+console.log('sync');
+// sync, nextTick, promise, then timeout/immediate (order of these two may vary)
+```
+
+Когда что использовать:
+- `setImmediate`: «сделай скоро, но пропусти вперёд ввод-вывод». Подходит, чтобы разбить долгую работу на куски и не душить цикл.
+- `queueMicrotask` / промисы: «сразу после текущего кода».
+- `process.nextTick`: в основном для кода библиотек, например чтобы отправить событие после того, как вызывающий код подписался. Опасен: рекурсивный `nextTick` не даёт циклу двигаться дальше, и ввод-вывод голодает.
+
+Названия путают почти намеренно: `nextTick` на деле более «немедленный», чем `setImmediate`.
+
+## node-blocking
+Что значит заблокировать event loop и как этого избежать?
+--- short
+Блокировка — это синхронный код, который выполняется так долго, что единственный поток JavaScript не может обрабатывать ничего другого: тяжёлые циклы на CPU, `fs.readFileSync` на больших файлах, `JSON.parse` огромных данных, синхронная криптография, «катастрофические» регулярки. Все остальные запросы ждут. Избегай этого: асинхронные API, разбиение работы на куски, потоковая обработка больших данных и вынос тяжёлых вычислений в worker threads или отдельный сервис.
+--- details
+```js
+// ❌ blocks everyone for the whole loop
+app.get('/report', (req, res) => {
+  const result = heavyCalculation(bigArray);   // 3 seconds of CPU
+  res.json(result);
+});
+
+// ✅ move CPU work off the main thread
+import { Worker } from 'node:worker_threads';
+app.get('/report', (req, res) => {
+  const worker = new Worker('./report-worker.js', { workerData: params });
+  worker.once('message', (result) => res.json(result));
+  worker.once('error', (err) => res.status(500).end());
+});
+```
+
+Как это заметить:
+- Метрика **event loop lag** (`perf_hooks.monitorEventLoopDelay()`) и алерты на её рост.
+- Запросы замедляются все разом, даже простые вроде health check.
+- `--cpu-prof` или Clinic.js показывают, какая функция ест CPU.
+
+Типичные скрытые виновники: синхронные версии `bcrypt`, `JSON.stringify` больших объектов, сортировка огромных массивов, регулярки вроде `(a+)+` на пользовательском вводе (ReDoS), синхронные файловые API, забытые в обработчиках запросов.
+
+## node-libuv
+Что такое libuv и что делает её пул потоков?
+--- short
+libuv — библиотека на C под Node, которая даёт event loop и асинхронный ввод-вывод. Сетевой ввод-вывод использует неблокирующие механизмы ОС (epoll, kqueue, IOCP) и лишних потоков не требует. Операции, которые ОС не умеет делать асинхронно, — **файловая система**, **DNS-поиск** (`dns.lookup`), **криптография** (`pbkdf2`, `scrypt`) и сжатие **zlib** — выполняются в **пуле потоков** libuv, где по умолчанию 4 потока.
+--- details
+Почему это важно на практике:
+- По умолчанию всего 4 потока (`UV_THREADPOOL_SIZE`, до 1024). Если разом хешировать много паролей через асинхронный `crypto.pbkdf2` или читать много файлов, запросы встают в очередь к пулу, и даже не связанные вызовы `fs` замедляются.
+- `dns.lookup` (по умолчанию его использует `http.get`) тоже идёт через пул. Медленный DNS может незаметно занять все потоки.
+- Сетевые запросы (HTTP, сокеты базы данных) пул **не** используют, поэтому тысячи одновременных соединений — это нормально.
+
+```bash
+UV_THREADPOOL_SIZE=16 node server.js   # must be set before the pool is first used
+```
+
+Так что «Node однопоточный» — правда только наполовину: твой JavaScript выполняется в одном потоке, но сам Node под капотом использует несколько.
+
+## node-threads
+Как в Node.js устроена многопоточность: worker_threads, cluster и child_process?
+--- short
+JavaScript в Node выполняется в одном потоке, но есть три способа задействовать больше ядер. **worker_threads**: дополнительные потоки внутри того же процесса, у каждого свой event loop и экземпляр V8, — для тяжёлых вычислений; могут делить память через `SharedArrayBuffer`. **cluster**: несколько копий всего процесса на одном порту, чтобы обрабатывать запросы на всех ядрах. **child_process**: запустить другую программу или скрипт отдельным процессом.
+--- details
+| | worker_threads | cluster | child_process |
+|---|---|---|---|
+| Что это | потоки в одном процессе | копии процесса | любой отдельный процесс |
+| Память | отдельные кучи, можно делить буферы | полностью отдельная | полностью отдельная |
+| Типичное применение | вычисления: ресайз картинок, парсинг, хеширование | HTTP-сервер на всех ядрах | запуск CLI, скриптов, других языков |
+| Общение | `postMessage`, `SharedArrayBuffer` | IPC-сообщения | stdin/stdout, IPC |
+
+```js
+// child_process: run a CLI and read its output
+import { execFile } from 'node:child_process';
+execFile('git', ['rev-parse', 'HEAD'], (err, stdout) => console.log(stdout.trim()));
+```
+
+В современных деплоях `cluster` часто не нужен: в контейнере запускают один процесс Node, а несколько реплик поднимает **Kubernetes или PM2**. Worker threads остаются полезными для вычислительных задач внутри одного сервиса. Для больших и долгих вычислений часто чище отдельный сервис-воркер, читающий задачи из очереди.
+
+## node-streams
+Что такое стримы в Node.js и что такое backpressure?
+--- short
+Стримы обрабатывают данные **по кусочкам**, а не загружают всё в память: чтение файла на 5 ГБ, загрузка, проксирование ответа, сжатие. Бывают четырёх типов: **Readable**, **Writable**, **Duplex** (оба направления, как TCP-сокет) и **Transform** (меняет данные по пути, как gzip). **Backpressure** — когда потребитель медленнее производителя: писатель сигналит «стоп», читатель встаёт на паузу, и память не взрывается.
+--- details
+```js
+import { pipeline } from 'node:stream/promises';
+import fs from 'node:fs';
+import zlib from 'node:zlib';
+
+// compress a huge file with constant, small memory use
+await pipeline(
+  fs.createReadStream('big.log'),
+  zlib.createGzip(),
+  fs.createWriteStream('big.log.gz'),
+);
+```
+
+Как работает backpressure: `writable.write(chunk)` возвращает `false`, когда внутренний буфер заполнен. Правильный производитель останавливается и ждёт события `'drain'`. `pipe()` и `pipeline()` делают это автоматически.
+
+Практические моменты:
+- Предпочитай `pipeline()` цепочке `.pipe()`: он обрабатывает ошибки и закрывает все стримы, если один упал (с `.pipe()` ошибка посередине может оставить открытые файлы).
+- HTTP `req` и `res` — стримы: можно отдавать файл или большой CSV-экспорт потоком, не собирая его в памяти.
+- Readable-стримы асинхронно итерируемы: `for await (const chunk of stream)` — часто самый простой способ чтения.
+- Игнорировать backpressure (вызывать `write` в цикле, не проверяя результат) — классический способ закончить память.
+
+## node-buffer
+Что такое Buffer в Node.js?
+--- short
+`Buffer` — кусок «сырой» бинарной памяти фиксированного размера, выделенный вне кучи V8. Node использует его для бинарных данных: содержимое файлов, сетевые пакеты, картинки, криптография. Это подкласс `Uint8Array`, и он конвертируется в строки и обратно с кодировкой (`utf8`, `base64`, `hex`).
+--- details
+```js
+const buf = Buffer.from('Привет', 'utf8');
+buf.length;                 // 12 – bytes, not characters
+buf.toString('base64');     // '0J/RgNC40LLQtdGC'
+Buffer.from('ff00', 'hex'); // <Buffer ff 00>
+
+const safe = Buffer.alloc(10);        // zero-filled
+const fast = Buffer.allocUnsafe(10);  // may contain old memory – fill it before use
+```
+
+Что стоит знать:
+- `length` — в **байтах**: кириллица в UTF-8 занимает 2 байта, эмодзи — 4. Не считай длину содержимого по длине строки.
+- `allocUnsafe` быстрее, но может «утечь» старое содержимое памяти, если отправить буфер до перезаписи.
+- При склейке кусков из стрима используй `Buffer.concat(chunks)` и декодируй текст только в конце, иначе многобайтовый символ, разрезанный между кусками, испортится (или используй `setEncoding('utf8')` / `TextDecoder` в потоковом режиме).
+- В современном коде многие API принимают любой `Uint8Array`, а в браузере аналоги — `ArrayBuffer`, `Uint8Array`, `TextEncoder` и `TextDecoder`.
+
+## node-errors
+Как обрабатывать ошибки в Node.js и что будет при необработанном исключении или отклонённом промисе?
+--- short
+Обрабатывай ошибки там, где они возникают: `try/catch` вокруг `await`, `.catch()` у промисов, событие `'error'` у стримов и эмиттеров. **Необработанное исключение** роняет процесс (Node печатает стек и завершается). С Node 15 **необработанный rejection промиса** тоже роняет процесс. `process.on('uncaughtException')` и `'unhandledRejection'` нужны для логирования и аккуратной остановки, а не чтобы «продолжить как ни в чём не бывало».
+--- details
+```js
+process.on('unhandledRejection', (reason) => {
+  logger.fatal({ reason }, 'unhandled rejection');
+  throw reason;                     // turn it into an uncaught exception
+});
+
+process.on('uncaughtException', (err) => {
+  logger.fatal({ err }, 'uncaught exception');
+  server.close(() => process.exit(1));            // stop accepting, finish, exit
+  setTimeout(() => process.exit(1), 10_000).unref(); // safety timeout
+});
+```
+
+Почему нужно завершаться, а не продолжать: после неожиданного исключения процесс может быть в сломанном состоянии (наполовину записанные данные, неотпущенные блокировки). Безопасная схема: залогировать, аккуратно остановиться и дать менеджеру процессов (Kubernetes, PM2, systemd) поднять свежий экземпляр.
+
+Другие важные моменты:
+- Различай **операционные ошибки** (БД недоступна, неверный ввод, таймаут — ожидаемые, их обрабатывают и возвращают 4xx/5xx) и **ошибки программиста** (баги — падаем и чиним).
+- `EventEmitter`, который отправляет `'error'` без подписчика, бросает исключение.
+- В Express 4 ошибки в асинхронных обработчиках нужно передавать в `next(err)`, иначе они станут необработанными rejection (Express 5 и NestJS обрабатывают асинхронные ошибки сами).
+- Коды выхода важны для CLI и CI: `0` — успех, всё остальное — сбой.
+
+## node-graceful-shutdown
+Что такое graceful shutdown и как его реализовать в Node.js?
+--- short
+Graceful shutdown — когда процесс при просьбе остановиться (`SIGTERM` от Kubernetes, Docker или PM2 при деплое) **перестаёт принимать новые запросы, доделывает текущие, закрывает соединения** с базой, очередями и кешами и только потом завершается. Без этого каждый деплой обрывает активные запросы и может оставить незаконченную работу.
+--- details
+```js
+const server = app.listen(3000);
+
+async function shutdown(signal) {
+  logger.info({ signal }, 'shutting down');
+  setTimeout(() => process.exit(1), 25_000).unref();   // don't hang forever
+  server.close(async () => {                             // stop accepting, wait for in-flight
+    await Promise.allSettled([db.end(), redis.quit(), queue.close()]);
+    process.exit(0);
+  });
+}
+
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
+```
+
+Детали, о которых спрашивают:
+- Kubernetes отправляет `SIGTERM`, ждёт `terminationGracePeriodSeconds` (по умолчанию 30 с), потом `SIGKILL`. Твой таймаут должен быть короче.
+- Сначала начни проваливать **readiness probe**, чтобы балансировщик перестал слать трафик до закрытия сервера.
+- Keep-alive соединения могут держать `server.close()` в ожидании: закрывай простаивающие сокеты (`server.closeIdleConnections()` в новых версиях Node).
+- Осторожно с Node как PID 1 в Docker: используй `CMD ["node", "server.js"]` (exec-форма), а не `npm start`, который может не передавать сигналы.
+- В NestJS: `app.enableShutdownHooks()` плюс хуки `onModuleDestroy` / `beforeApplicationShutdown`.
+
+## node-memory-leak
+Как найти и исправить утечку памяти в сервисе на Node.js?
+--- short
+Симптом: память растёт часами или днями, и процесс в итоге перезапускается с «JavaScript heap out of memory» или его убивает Kubernetes (OOMKilled). Чтобы найти утечку, сделай **heap snapshot** в два момента времени (Chrome DevTools через `--inspect` или `v8.writeHeapSnapshot()`) и сравни, что выросло. Типичные причины — кеши без ограничений, глобальные массивы и Map, забытые обработчики и таймеры, замыкания с большими объектами.
+--- details
+Процесс:
+1. Убедись, что это утечка: при постоянной нагрузке память должна падать после GC. Пила — норма, постоянно растущее «дно» — утечка.
+2. Воспроизведи под нагрузкой локально или на стенде (autocannon, k6).
+3. Сделай снимок A, прогони трафик, сделай снимок B и открой режим **Comparison**, отсортировав по росту размера. Пройди по **retainers**, чтобы понять, кто держит объекты.
+
+Частые источники утечек в Node:
+- `Map` в памяти как кеш без TTL и лимита размера. Используй LRU-кеш или Redis.
+- `emitter.on(...)` внутри обработчика запроса — новый слушатель на каждый запрос (Node предупреждает «MaxListenersExceededWarning»).
+- Неочищенный `setInterval`, который держит ссылки.
+- Данные конкретного запроса, сохранённые в переменных уровня модуля.
+- Большие замыкания в долгоживущих колбэках.
+
+Смягчение: лимиты памяти и алерты, `--max-old-space-size` под лимит контейнера, перезапуски процесса как страховка (но не как решение).
+
+## node-scaling
+Как масштабировать приложение на Node.js?
+--- short
+Сначала сделай сервис **stateless**: никаких сессий и кешей в памяти процесса, файлы — в объектное хранилище, общее состояние — в Redis или базу. Затем масштабируй **горизонтально**: несколько экземпляров за балансировщиком (реплики в Kubernetes, PM2 или cluster на одной машине). Узкие места масштабируй отдельно: соединения и реплики базы, кеширование, очереди для тяжёлой или медленной работы.
+--- details
+Чек-лист:
+- **Один процесс на контейнер**, несколько реплик, автомасштабирование по CPU или числу запросов (HPA в Kubernetes).
+- **Авторизация без состояния**: сессии в Redis или JWT, чтобы любой экземпляр мог обслужить любой запрос.
+- **Кеширование**: HTTP-кеш и CDN для публичных ответов, Redis для вычисленных данных.
+- **База данных**: пул соединений с расчётом `экземпляры × размер пула` (у Postgres есть лимит соединений), реплики на чтение, индексы и PgBouncer при большом числе экземпляров.
+- **Фоновая работа**: письма, отчёты, обработку картинок — в очередь (BullMQ, RabbitMQ, Kafka) с отдельными воркерами.
+- **WebSocket**: нужен общий pub/sub (адаптер Redis), чтобы сообщения доходили до пользователей на других экземплярах, плюс sticky sessions или отдельный gateway.
+- **Измеряй**: event loop lag, p95 задержки, частоту ошибок на экземпляр. Новые реплики не помогут, если узкое место — база.
+
+## node-express-middleware
+Что такое middleware в Express и почему важен порядок?
+--- short
+Middleware — функция `(req, res, next)` в конвейере обработки запроса. Она может прочитать или изменить запрос и ответ, завершить запрос или вызвать `next()`, чтобы передать управление дальше. Express выполняет middleware **в порядке регистрации**, поэтому порядок определяет поведение: парсинг тела — до обработчиков, читающих `req.body`, авторизация — до защищённых маршрутов, обработчик ошибок (4 аргумента) — последним.
+--- details
+```js
+const app = express();
+
+app.use(helmet());                      // security headers
+app.use(express.json({ limit: '1mb' })); // parse JSON body
+app.use(requestLogger);                  // logging with request id
+
+app.use('/api/admin', requireAuth, requireRole('admin'), adminRouter);
+app.use('/api', apiRouter);
+
+app.use((req, res) => res.status(404).json({ message: 'Not found' }));
+app.use((err, req, res, next) => {       // error handler: 4 arguments, registered last
+  logger.error(err);
+  res.status(err.status ?? 500).json({ message: 'Internal error' });
+});
+```
+
+Виды middleware: уровня приложения (`app.use`), уровня роутера (`router.use`), для конкретного маршрута (передаётся в `app.get(path, mw, handler)`), обработчики ошибок и встроенные или сторонние (`express.json`, `cors`, `helmet`, `morgan`/`pino-http` для логирования).
+
+Частые ошибки: забыть вызвать `next()` или отправить ответ (запрос зависает), вызвать `next()` после отправки ответа («headers already sent») и зарегистрировать обработчик ошибок до маршрутов.
+
+## node-security
+Какие основные практики безопасности для API на Node.js?
+--- short
+Валидировать весь ввод (схемы Zod, class-validator или Joi), использовать параметризованные запросы или ORM против SQL-инъекций, хешировать пароли через bcrypt или argon2, хранить секреты в переменных окружения или хранилище секретов, ставить заголовки безопасности (helmet), строго настраивать CORS, добавить rate limiting, никогда не отдавать стектрейсы в ответах, обновлять и аудировать зависимости и запускать процесс с минимальными правами.
+--- details
+Подробнее о важном:
+- **Инъекции**: никогда не собирай SQL из строк. `db.query('SELECT * FROM users WHERE id = $1', [id])`. С командами оболочки так же: `execFile` с массивом аргументов, а не `exec` со строкой.
+- **Авторизация**: короткоживущие access-токены, ротация refresh-токенов, куки httpOnly + Secure + SameSite, проверка прав на **каждом** эндпоинте (а не только в UI).
+- **Rate limiting и перебор**: лимит попыток входа на пользователя и на IP, CAPTCHA после неудач.
+- **Лимиты на запросы**: `express.json({ limit })`, проверка размера и типа загружаемых файлов, таймауты.
+- **Mass assignment**: не передавай `req.body` напрямую в обновление через ORM. Белый список полей через DTO.
+- **Prototype pollution**: осторожно с глубоким слиянием пользовательского JSON.
+- **Зависимости**: `npm audit`, Dependabot или Renovate, lock-файлы, ревью новых пакетов.
+- **Ошибки и логи**: общие сообщения клиенту, подробности только в логах, никаких паролей и токенов в логах.
+- **HTTPS везде**, HSTS и никаких секретов в git.
+
+## node-prod-debug
+Сервис на Node.js тормозит или падает в продакшене. Как будешь разбираться?
+--- short
+Начинаю с данных, а не с догадок: смотрю дашборды и логи — **когда** это началось (деплой? всплеск трафика? зависимость?), какие эндпоинты медленные, выросли ли CPU, память или event loop lag. Затем сужаю круг: медленные запросы к базе, задержки внешних API, блокировка event loop, утечки памяти или упор в лимиты ресурсов. Сначала смягчаю (откат, больше реплик, выключить фичу), потом ищу первопричину.
+--- details
+Пошаговый разбор:
+1. **Влияние и хронология**: частота ошибок, задержки p95/p99, какие экземпляры. Связать с деплоями и изменениями конфигурации. Если виноват деплой — сначала **откатиться**.
+2. **Насыщение**: CPU около 100% — похоже на блокирующий код. Память всё время растёт — похоже на утечку, а перезапуски подов с `OOMKilled` это подтверждают. Много открытых соединений к БД или полный пул — медленные запросы или неосвобождённые соединения.
+3. **Трейсы**: распределённая трассировка (OpenTelemetry) показывает, куда уходит время: БД, Redis, внешние вызовы или свой код.
+4. **База данных**: `pg_stat_statements` для самых медленных запросов, `EXPLAIN ANALYZE`, недостающие индексы, ожидание блокировок.
+5. **Внутренности Node**: event loop lag, flame graph через `--cpu-prof` или `0x` для CPU, heap snapshots для памяти.
+6. **Падения**: последние логи перед выходом, код выхода, необработанные rejection, события Kubernetes (`kubectl describe pod`).
+7. После исправления: добавить недостающий алерт или метрику и написать короткий постмортем.
+
+## nest-what
+Что такое NestJS и чем он отличается от Express?
+--- short
+NestJS — фреймворк для серверных приложений на Node.js, написанный на TypeScript. Под капотом для HTTP он использует Express (или Fastify), но добавляет **структуру**: модули, контроллеры, провайдеры, **внедрение зависимостей** и понятный конвейер обработки запроса (guards, pipes, interceptors, exception filters). Express даёт минимальный роутер и middleware, а архитектуру оставляет тебе. Nest даёт соглашения, которые держат большой код и большую команду в едином стиле.
+--- details
+```ts
+@Controller('users')
+export class UsersController {
+  constructor(private readonly users: UsersService) {}   // injected by Nest
+
+  @Get(':id')
+  findOne(@Param('id', ParseIntPipe) id: number) {
+    return this.users.findOne(id);
+  }
+}
+```
+
+На Express то же самое было бы обработчиком маршрута, где ты сам разбираешь и валидируешь `id` и сам импортируешь или создаёшь сервис.
+
+Что добавляет Nest:
+- **DI-контейнер**: сервисы создаются и внедряются за тебя, поэтому тестировать с моками легко.
+- **Декораторы** для маршрутов, параметров, валидации и метаданных.
+- Встроенная поддержка валидации (`ValidationPipe` + DTO), конфигурации, документации OpenAPI, WebSocket, микросервисов, GraphQL, расписаний, очередей.
+- Заданная структура, похожая на Angular, поэтому новый разработчик быстро находит что где.
+
+Компромиссы: больше бойлерплейта и абстракций, порог входа (DI, декораторы, жизненный цикл), тяжеловат для крошечного сервиса. Для маленького скрипта или одного эндпоинта хватит Express или Fastify. Для продукта с множеством модулей и разработчиков структура Nest окупается.
+
+## nest-modules
+Что такое модули, контроллеры и провайдеры в NestJS?
+--- short
+**Модуль** (`@Module`) группирует связанный код и объявляет, что в нём есть и чем он делится: `controllers`, `providers`, `imports` (какие модули ему нужны) и `exports` (какими провайдерами он делится). **Контроллер** принимает входящие запросы и связывает маршруты с методами; он должен быть тонким. **Провайдер** — всё, что Nest умеет внедрять: обычно сервис с бизнес-логикой, репозиторий или клиент, помеченный `@Injectable()`.
+--- details
+```ts
+@Module({
+  imports: [TypeOrmModule.forFeature([User])],  // what this module needs
+  controllers: [UsersController],               // HTTP layer
+  providers: [UsersService],                    // business logic
+  exports: [UsersService],                      // available to modules that import UsersModule
+})
+export class UsersModule {}
+```
+
+Правила, которые стоит знать:
+- Провайдеры **приватны для своего модуля**, если их не экспортировать. Чтобы использовать `UsersService` в `OrdersModule`, `UsersModule` должен его экспортировать, а `OrdersModule` — импортировать `UsersModule`.
+- Обычно один модуль на фичу или домен (users, orders, auth) плюс общие или core-модули.
+- Контроллеры занимаются деталями HTTP (маршруты, коды статуса, DTO) и делегируют сервисам. Сервисы не должны знать про `req` и `res` — так их можно переиспользовать из очередей, cron-задач или других транспортов.
+- `@Global()` делает экспорты модуля доступными везде без импорта. Используй редко (конфигурация, логгер), потому что это прячет зависимости.
+
+## nest-di
+Как работает внедрение зависимостей в NestJS и что такое scopes провайдеров?
+--- short
+При старте приложения Nest читает типы параметров конструктора каждого провайдера (из метаданных TypeScript), строит граф зависимостей, создаёт каждый провайдер **один раз** (по умолчанию singleton) и передаёт экземпляры в конструкторы, которым они нужны. Свои провайдеры можно регистрировать через `useValue`, `useClass`, `useFactory` или `useExisting` и внедрять по токену через `@Inject()`. Scopes: **DEFAULT** (singleton), **REQUEST** (новый экземпляр на каждый запрос) и **TRANSIENT** (новый экземпляр для каждого потребителя).
+--- details
+```ts
+@Module({
+  providers: [
+    UsersService,                                            // class provider
+    { provide: 'PAYMENT_GATEWAY', useClass: StripeGateway }, // swap implementations
+    { provide: 'CONFIG', useValue: { retries: 3 } },
+    {
+      provide: 'DB_POOL',
+      useFactory: async (config: ConfigService) => createPool(config.get('DB_URL')),
+      inject: [ConfigService],                               // async setup with dependencies
+    },
+  ],
+})
+export class AppModule {}
+
+@Injectable()
+export class OrdersService {
+  constructor(@Inject('PAYMENT_GATEWAY') private readonly payments: PaymentGateway) {}
+}
+```
+
+Почему это важно:
+- **Тестирование**: в `Test.createTestingModule` провайдер подменяется моком (`.overrideProvider(UsersRepository).useValue(mock)`).
+- **Подмена реализаций** по окружению (фейковая отправка писем локально, настоящая в продакшене).
+- Интерфейсы в TypeScript исчезают в рантайме, поэтому чтобы внедрить «интерфейс», используют строковый токен или Symbol.
+
+Scopes на практике: оставляй singleton по умолчанию. **Request-scoped** провайдер делает request-scoped всё, что от него зависит («scope всплывает вверх»), и Nest на каждый запрос создаёт цепочку объектов — это бьёт по производительности. Для данных конкретного запроса (пользователь, тенант, correlation ID) лучше передавать значения явно или использовать `AsyncLocalStorage` (например пакет `nestjs-cls`).
+
+## nest-lifecycle
+Какой жизненный цикл у запроса в NestJS?
+--- short
+Входящий запрос проходит: **middleware** → **guards** → **interceptors** (до обработчика) → **pipes** → **обработчик контроллера** → сервис → **interceptors** (после, с ответом) → **exception filters** (если что-то бросило исключение) → ответ. Внутри каждого вида порядок такой: глобальные, потом уровня контроллера, потом уровня маршрута.
+--- details
+```
+Request
+  → Middleware           (Express-style: logging, cookies, raw request work)
+  → Guards               (can this request proceed? auth, roles)
+  → Interceptors (before)(start timer, check cache)
+  → Pipes                (validate and transform params/body)
+  → Controller handler → Service
+  → Interceptors (after) (map the response, log duration)
+  → Exception filters    (only if something threw anywhere above)
+Response
+```
+
+Зачем нужна каждая часть:
+- **Middleware**: низкоуровневая работа с запросом, без знания, какой обработчик выполнится.
+- **Guard**: возвращает `true`/`false` — аутентификация и авторизация. Имеет доступ к `ExecutionContext`, поэтому может читать метаданные обработчика вроде `@Roles('admin')`.
+- **Interceptor**: оборачивает обработчик (RxJS вокруг результата) — логирование, замер времени, кеширование, преобразование ответа, таймауты.
+- **Pipe**: валидирует и преобразует входные данные (`ValidationPipe`, `ParseIntPipe`).
+- **Exception filter**: превращает исключения в HTTP-ответы в едином формате.
+
+Хороший ответ объясняет не только порядок, но и логику: отклонить неавторизованный запрос (guards) раньше, чем тратить силы на валидацию (pipes), и поймать всё в конце (filters).
+
+## nest-interceptors
+Что такое interceptors в NestJS и что с ними можно делать?
+--- short
+Interceptor оборачивает обработчик маршрута: выполняет код **до** обработчика и получает результат обработчика как RxJS `Observable`, поэтому может действовать и **после**. Типичные применения: логирование и замер времени, приведение всех ответов к одной форме, кеширование, таймауты и преобразование ошибок. Это вариант аспектно-ориентированного программирования в Nest.
+--- details
+```ts
+@Injectable()
+export class LoggingInterceptor implements NestInterceptor {
+  intercept(context: ExecutionContext, next: CallHandler): Observable<unknown> {
+    const req = context.switchToHttp().getRequest();
+    const started = Date.now();
+    return next.handle().pipe(
+      tap(() => logger.info({ path: req.url, ms: Date.now() - started })),
+      timeout(5000),                                     // fail slow handlers
+    );
+  }
+}
+
+// wrap every response: { data: ... }
+@Injectable()
+export class WrapResponseInterceptor implements NestInterceptor {
+  intercept(_: ExecutionContext, next: CallHandler) {
+    return next.handle().pipe(map((data) => ({ data })));
+  }
+}
+```
+
+Подключение: `@UseInterceptors()` на контроллере или методе, `app.useGlobalInterceptors()` или `{ provide: APP_INTERCEPTOR, useClass: ... }` в модуле (так interceptor может использовать DI).
+
+Встроенные примеры: `ClassSerializerInterceptor` (применяет `@Exclude()` из class-transformer, чтобы скрыть поля вроде паролей) и `CacheInterceptor`.
+
+Interceptor или middleware: middleware не знает, какой обработчик выполнится, и не может работать с результатом. У interceptor есть `ExecutionContext` (метаданные обработчика) и поток ответа.
+
+## nest-validation
+Что такое DTO в NestJS и как работает ValidationPipe?
+--- short
+**DTO** (Data Transfer Object) — класс, описывающий форму данных, которые приходят в API (тело запроса, query) или уходят из него. С декораторами **class-validator** на DTO и глобальным **ValidationPipe** Nest автоматически валидирует каждый запрос: превращает обычный JSON в экземпляр DTO (class-transformer), запускает валидаторы и при ошибках возвращает `400 Bad Request` со списком проблем.
+--- details
+```ts
+export class CreateUserDto {
+  @IsEmail()
+  email: string;
+
+  @IsString() @MinLength(8)
+  password: string;
+
+  @IsOptional() @IsInt() @Min(18)
+  age?: number;
+}
+
+// main.ts
+app.useGlobalPipes(new ValidationPipe({
+  whitelist: true,              // strip properties without decorators
+  forbidNonWhitelisted: true,   // or reject them with 400
+  transform: true,              // turn payloads into DTO instances, '42' → 42 for typed params
+}));
+```
+
+Почему это важно:
+- `whitelist` защищает от **mass assignment**: клиент не сможет подсунуть `isAdmin: true` в обновление.
+- Один источник правды для документации API: `@nestjs/swagger` читает DTO и генерирует OpenAPI.
+- Держи DTO отдельно от сущностей базы данных. У сущности есть внутренние поля (хеш пароля, служебные флаги), которые не должны утечь, а форма API и форма хранения меняются по разным причинам.
+
+Альтернатива: схемы Zod со своим pipe (`nestjs-zod`) — валидация и типы TypeScript из одного определения, которое можно разделить с фронтендом.
+
+## nest-guards
+Что такое guard в NestJS и как сделать доступ по ролям?
+--- short
+Guard реализует `canActivate(context)` и решает, может ли запрос дойти до обработчика: вернуть `true`, чтобы продолжить, `false` (403) или бросить исключение (например 401). Guards — правильное место для **аутентификации** (есть ли валидный токен?) и **авторизации** (есть ли у пользователя нужная роль или право?). Для ролей на обработчики ставят метаданные своим декоратором и читают их в guard через `Reflector`.
+--- details
+```ts
+export const Roles = (...roles: Role[]) => SetMetadata('roles', roles);
+
+@Injectable()
+export class RolesGuard implements CanActivate {
+  constructor(private readonly reflector: Reflector) {}
+
+  canActivate(context: ExecutionContext): boolean {
+    const required = this.reflector.getAllAndOverride<Role[]>('roles', [
+      context.getHandler(),
+      context.getClass(),
+    ]);
+    if (!required) return true;                     // no @Roles → open to any logged-in user
+    const { user } = context.switchToHttp().getRequest();
+    return required.some((role) => user?.roles?.includes(role));
+  }
+}
+
+@Controller('reports')
+@UseGuards(JwtAuthGuard, RolesGuard)
+export class ReportsController {
+  @Get() @Roles('admin', 'analyst')
+  list() { /* ... */ }
+}
+```
+
+Хорошие практики:
+- Регистрируй guards аутентификации **глобально** (`APP_GUARD`) и помечай публичные маршруты декоратором `@Public()`. Тогда новый эндпоинт защищён по умолчанию, и забытый guard его не откроет.
+- Ролей часто мало: проверяй ещё и **владение** («может ли этот пользователь редактировать *этот* заказ?»), обычно в сервисе или через библиотеку политик вроде CASL.
+- Guards выполняются до pipes, поэтому внутри guard тело запроса ещё не провалидировано.
+
+## nest-exception-filters
+Как обрабатывать ошибки в NestJS?
+--- short
+Бросай исключения из сервисов и контроллеров: встроенные наследники `HttpException` (`NotFoundException`, `BadRequestException`, `ForbiddenException`, `ConflictException`...) автоматически превращаются в нужный HTTP-статус. Всё остальное становится `500`. Чтобы управлять **форматом** ошибок в одном месте (и логировать их), напиши **exception filter** с `@Catch()` и зарегистрируй его глобально.
+--- details
+```ts
+@Catch()
+export class AllExceptionsFilter implements ExceptionFilter {
+  constructor(private readonly logger: Logger) {}
+
+  catch(exception: unknown, host: ArgumentsHost) {
+    const ctx = host.switchToHttp();
+    const res = ctx.getResponse<Response>();
+    const req = ctx.getRequest<Request>();
+
+    const status = exception instanceof HttpException ? exception.getStatus() : 500;
+    if (status >= 500) this.logger.error(exception, undefined, req.url);
+
+    res.status(status).json({
+      statusCode: status,
+      message: status >= 500 ? 'Internal server error' : (exception as HttpException).message,
+      path: req.url,
+      timestamp: new Date().toISOString(),
+    });
+  }
+}
+```
+
+Единая стратегия для большого приложения:
+- **Доменные ошибки** в сервисах (`UserNotFoundError`, `InsufficientBalanceError`) без знания об HTTP, а сопоставление с HTTP-кодами — в фильтре. Тогда тот же сервис работает из обработчика очереди или cron-задачи.
+- Сопоставляй ошибки базы: нарушение уникальности (код Postgres `23505`) — это `409 Conflict`, а не `500`.
+- Никогда не отправляй клиенту стектрейсы и SQL. Логируй их с request или correlation ID, который возвращается и клиенту.
+- Один формат ошибок на всё API, желательно задокументированный (например RFC 9457 Problem Details).
+
+## nest-dynamic-modules
+Что такое динамические модули и что такое `forRoot`, `forFeature` и `forRootAsync`?
+--- short
+**Динамический модуль** — модуль, который настраивается при импорте: статический метод возвращает определение модуля с провайдерами, собранными из твоих опций. По соглашению `forRoot(options)` настраивает что-то **один раз на всё приложение** (подключение к базе, конфигурацию), `forFeature(...)` регистрирует части для конкретного модуля (какие сущности или репозитории использует фича), а `forRootAsync` делает то же, что `forRoot`, но собирает опции фабрикой, которая может внедрять другие провайдеры, обычно `ConfigService`.
+--- details
+```ts
+@Module({
+  imports: [
+    ConfigModule.forRoot({ isGlobal: true }),
+    TypeOrmModule.forRootAsync({
+      inject: [ConfigService],
+      useFactory: (config: ConfigService) => ({
+        type: 'postgres',
+        url: config.get('DATABASE_URL'),
+        autoLoadEntities: true,
+      }),
+    }),
+  ],
+})
+export class AppModule {}
+
+@Module({
+  imports: [TypeOrmModule.forFeature([Order, OrderItem])],  // repositories for this feature
+  providers: [OrdersService],
+})
+export class OrdersModule {}
+```
+
+Зачем нужен `forRootAsync`: переменные окружения загружает `ConfigModule` в рантайме, поэтому их нельзя прочитать в статическом объекте внутри `@Module()`. Фабрика выполняется, когда `ConfigService` уже готов.
+
+Свой динамический модуль: модуль со `static register(options): DynamicModule`, который возвращает `{ module, providers: [{ provide: OPTIONS, useValue: options }, MyService], exports: [MyService] }`. В новых версиях Nest есть `ConfigurableModuleBuilder`, который генерирует этот бойлерплейт.
+
+## nest-circular
+Что такое циклическая зависимость в NestJS и как с ней быть?
+--- short
+Циклическая зависимость — когда провайдеру A нужен B, а B нужен A (или модули импортируют друг друга). Nest не может решить, что создавать первым, и падает при старте с «Nest can't resolve dependencies». Быстрое решение — `forwardRef(() => B)` с обеих сторон. Правильное — поменять дизайн: вынести общую логику в третий сервис или использовать события, чтобы одной стороне не нужно было вызывать другую напрямую.
+--- details
+```ts
+// quick fix
+@Injectable()
+export class UsersService {
+  constructor(@Inject(forwardRef(() => OrdersService)) private orders: OrdersService) {}
+}
+
+@Module({ imports: [forwardRef(() => OrdersModule)] })
+export class UsersModule {}
+```
+
+Почему переделка дизайна обычно лучше:
+- Цикл значит, что два модуля слишком много знают друг о друге. Изменения в одном отзываются в другом.
+- С `forwardRef` внедрённый экземпляр может быть ещё не готов в конструкторе, что даёт запутанные ошибки с `undefined`.
+
+Типичные рефакторинги:
+- Вынести код, нужный обеим сторонам, в модуль уровнем ниже (например `UserProfileService`, который используют оба).
+- **Доменные события** (`@nestjs/event-emitter` или очередь): `OrdersService` отправляет `order.created`, а модуль пользователей его слушает, не импортируя заказы.
+- Зависеть от токена интерфейса, а не от конкретного класса.
+
+Barrel-файлы (`index.ts`, реэкспортирующий всё) тоже могут создавать циклы импорта на уровне файлов. Импортируй из конкретных файлов, чтобы этого избежать.
+
+## nest-auth
+Как устроена аутентификация в NestJS?
+--- short
+Типичная схема: стратегии **Passport** (`@nestjs/passport`). `LocalStrategy` проверяет email и пароль при входе, после чего приложение выдаёт **JWT** (`@nestjs/jwt`). `JwtStrategy` проверяет токен в следующих запросах и кладёт пользователя в `request.user`, а `AuthGuard('jwt')` защищает маршруты. Для браузерных приложений токены часто хранят в httpOnly-куках или держат сессию на BFF.
+--- details
+```ts
+@Injectable()
+export class JwtStrategy extends PassportStrategy(Strategy) {
+  constructor(config: ConfigService) {
+    super({
+      jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
+      secretOrKey: config.get('JWT_SECRET'),
+      ignoreExpiration: false,
+    });
+  }
+  validate(payload: { sub: string; roles: string[] }) {
+    return { id: payload.sub, roles: payload.roles };   // becomes request.user
+  }
+}
+
+@Post('login')
+@UseGuards(AuthGuard('local'))
+login(@Req() req) {
+  return this.auth.issueTokens(req.user);   // access token + refresh token
+}
+```
+
+Что добавит senior:
+- **Короткоживущие access-токены** (минуты) плюс **refresh-токены** (хранятся в базе в виде хеша, меняются при каждом использовании, их можно отозвать). Сам по себе JWT нельзя отозвать до истечения срока.
+- Хешируй пароли через bcrypt или argon2, никогда не храни и не логируй их в открытом виде.
+- Проверяй claims токена: подпись, срок, издателя (issuer), аудиторию (audience).
+- Для внешних провайдеров идентификации (Keycloak, Google, Auth0) используй OpenID Connect: проверяй их токены публичными ключами провайдера (JWKS).
+- Ограничивай частоту попыток входа, блокируй после множества неудачных.
+- Аутентификация (кто ты) и авторизация (что тебе можно) — отдельные guards.
+
+## nest-db
+Как работать с базой данных в NestJS: TypeORM, Prisma и транзакции?
+--- short
+У Nest есть модули интеграции для **TypeORM** (`@nestjs/typeorm`: сущности с декораторами, репозитории внедряются через `@InjectRepository`), **Prisma** (сгенерированный, полностью типизированный клиент, обёрнутый в `PrismaService`), MikroORM и Sequelize. Подключение настраивается один раз через `forRootAsync`, а сервисы работают через репозитории или клиент. Для операций, которые должны выполниться целиком или не выполниться вовсе, используют **транзакцию**.
+--- details
+```ts
+// TypeORM: transfer money atomically
+async transfer(fromId: string, toId: string, amount: number) {
+  await this.dataSource.transaction(async (manager) => {
+    const from = await manager.findOne(Account, { where: { id: fromId }, lock: { mode: 'pessimistic_write' } });
+    if (from.balance < amount) throw new BadRequestException('Insufficient funds');
+    await manager.decrement(Account, { id: fromId }, 'balance', amount);
+    await manager.increment(Account, { id: toId }, 'balance', amount);
+  });
+}
+
+// Prisma
+await this.prisma.$transaction([
+  this.prisma.account.update({ where: { id: fromId }, data: { balance: { decrement: amount } } }),
+  this.prisma.account.update({ where: { id: toId }, data: { balance: { increment: amount } } }),
+]);
+```
+
+Что нужно знать:
+- **Миграции**, а не `synchronize: true` в продакшене: изменения схемы должны быть версионированы и пройти ревью.
+- Каждый запрос внутри транзакции должен идти через менеджер или клиент транзакции, иначе он выполнится вне неё.
+- Следи за **N+1 запросами** при загрузке связей и проверяй SQL, который генерирует ORM.
+- Держи детали репозитория и ORM внутри сервисов, чтобы контроллеры не зависели от базы.
+- Prisma: отличные типы и удобство. TypeORM: классические декораторы и Active Record или Data Mapper. Чистый SQL через query builder (Kysely, Knex) — нормальный выбор для сложных отчётов.
+
+## nest-testing
+Как тестировать приложение на NestJS?
+--- short
+**Юнит-тесты**: собрать модуль через `Test.createTestingModule`, заменить зависимости моками (`.overrideProvider()` или `useValue`) и проверить логику сервиса изолированно на Jest или Vitest. **E2E-тесты**: поднять всё приложение (или модуль) с настоящим HTTP-слоем и обращаться к нему через **Supertest**, в идеале с настоящей тестовой базой (Docker или Testcontainers), чтобы проверить вместе маршрутизацию, валидацию, guards и сериализацию.
+--- details
+```ts
+describe('UsersService', () => {
+  let service: UsersService;
+  const repo = { findOne: jest.fn() };
+
+  beforeEach(async () => {
+    const module = await Test.createTestingModule({
+      providers: [UsersService, { provide: getRepositoryToken(User), useValue: repo }],
+    }).compile();
+    service = module.get(UsersService);
+  });
+
+  it('throws when user is missing', async () => {
+    repo.findOne.mockResolvedValue(null);
+    await expect(service.findOne(1)).rejects.toThrow(NotFoundException);
+  });
+});
+
+// e2e
+it('POST /users validates the body', () =>
+  request(app.getHttpServer()).post('/users').send({ email: 'nope' }).expect(400));
+```
+
+Стратегия на большом проекте:
+- Юнит-тестами покрывай бизнес-логику, а не связывание фреймворка.
+- E2E — для важных сценариев: авторизация, права, основной CRUD, формат ошибок. В e2e подключай те же глобальные pipes, filters и interceptors, что в `main.ts`, иначе тест проверяет другое приложение.
+- Для тестов репозиториев и запросов используй настоящую базу: моки не поймают неверный SQL, ограничения и миграции.
+- Сбрасывай данные между тестами (откат транзакций или очистка таблиц).
+- Контрактные тесты или сгенерированный OpenAPI-клиент помогают держать фронтенд и бэкенд синхронными.
+
+## nest-microservices
+Как NestJS поддерживает микросервисы и какие есть транспорты?
+--- short
+`@nestjs/microservices` позволяет приложению на Nest принимать сообщения не только по HTTP: **TCP**, **Redis**, **NATS**, **RabbitMQ**, **Kafka**, **gRPC**, **MQTT**. Обработчики помечаются `@MessagePattern()` (запрос-ответ) или `@EventPattern()` (события без ответа), а другие сервисы вызывают их через `ClientProxy`. Одно приложение может быть и **гибридным**: обслуживать HTTP и одновременно слушать очередь.
+--- details
+```ts
+// orders service
+@Controller()
+export class OrdersController {
+  @EventPattern('payment.succeeded')
+  async onPaid(@Payload() data: { orderId: string }) {
+    await this.orders.markPaid(data.orderId);
+  }
+
+  @MessagePattern({ cmd: 'get_order' })
+  getOrder(@Payload() id: string) {
+    return this.orders.findOne(id);
+  }
+}
+
+// another service
+const order = await firstValueFrom(this.ordersClient.send({ cmd: 'get_order' }, id));
+this.ordersClient.emit('order.shipped', { orderId: id });
+```
+
+Что обсудить помимо API:
+- **Запрос-ответ через брокер** создаёт сильную связанность и цепочки задержек. Между сервисами по возможности лучше **события**.
+- **Гарантии доставки**: большинство брокеров дают доставку «хотя бы один раз» (at-least-once), поэтому обработчики должны быть **идемпотентными** (повторная обработка того же сообщения должна быть безопасной).
+- Повторы, dead-letter очереди и версионирование схем сообщений.
+- **Паттерн outbox**, чтобы надёжно публиковать событие вместе с изменением в базе.
+- gRPC — для типизированных быстрых внутренних вызовов. Kafka — для больших потоков событий.
+
+## nest-config
+Как управлять конфигурацией и переменными окружения в NestJS?
+--- short
+Используй `@nestjs/config`: `ConfigModule.forRoot({ isGlobal: true })` загружает `.env`-файлы и переменные окружения, а `ConfigService` внедряется, чтобы их читать. Важно: **валидируй** конфигурацию при старте схемой (Joi или Zod), чтобы приложение сразу падало на отсутствующей или неверной переменной, а не ломалось потом в продакшене. Связанные настройки группируй через `registerAs` в типизированные пространства имён.
+--- details
+```ts
+ConfigModule.forRoot({
+  isGlobal: true,
+  validationSchema: Joi.object({
+    NODE_ENV: Joi.string().valid('development', 'production', 'test').required(),
+    PORT: Joi.number().default(3000),
+    DATABASE_URL: Joi.string().uri().required(),
+    JWT_SECRET: Joi.string().min(32).required(),
+  }),
+});
+
+export const dbConfig = registerAs('db', () => ({
+  url: process.env.DATABASE_URL,
+  poolSize: parseInt(process.env.DB_POOL_SIZE ?? '10', 10),
+}));
+// usage: config.get('db.poolSize')
+```
+
+Хорошие практики (из идеи 12-factor app):
+- Конфигурация живёт в **окружении**, а не в коде. Один и тот же Docker-образ работает во всех окружениях с разными переменными.
+- **Секреты** (пароли, ключи) берутся из хранилища секретов или Kubernetes Secrets, никогда из git.
+- `.env`-файлы — только для локальной разработки. Коммить `.env.example` со всеми ключами и без настоящих значений.
+- Читай конфигурацию через `ConfigService` в одном месте, а не через `process.env`, разбросанный по коду.
+
+## sql-joins
+Какие бывают JOIN и какая таблица считается «левой» в LEFT JOIN?
+--- short
+**INNER JOIN** возвращает только строки, у которых есть совпадение в обеих таблицах. **LEFT JOIN** возвращает все строки левой таблицы (той, что написана **до** `JOIN`, после `FROM`) плюс совпавшие строки правой, а там, где совпадения нет, — `NULL`. **RIGHT JOIN** — зеркальный вариант. **FULL JOIN** сохраняет все строки обеих сторон. **CROSS JOIN** даёт все комбинации. Условие соединения пишется в `ON`, обычно оно связывает внешний ключ с первичным.
+--- details
+```sql
+-- all authors with their books; authors without books get NULL book columns
+SELECT a.id, a.name, b.title
+FROM authors a
+LEFT JOIN books b ON b.author_id = a.id;
+
+-- only authors who have at least one book
+SELECT a.name, b.title
+FROM authors a
+JOIN books b ON b.author_id = a.id;
+
+-- authors with no books at all (anti-join)
+SELECT a.name
+FROM authors a
+LEFT JOIN books b ON b.author_id = a.id
+WHERE b.id IS NULL;
+```
+
+Частые ловушки:
+- Условие на правую таблицу в `WHERE` превращает LEFT JOIN в INNER JOIN (`WHERE b.year > 2020` выкинет авторов без книг). Если их нужно сохранить, перенеси условие в `ON`: `LEFT JOIN books b ON b.author_id = a.id AND b.year > 2020`.
+- Соединение сразу двух связей «многие» перемножает строки (каждая книга × каждый отзыв), и `COUNT` и `SUM` ломаются. Сначала агрегируй в подзапросах или используй `COUNT(DISTINCT ...)`.
+- `NOT EXISTS (...)` часто понятнее анти-джойна через `LEFT JOIN ... IS NULL` и лучше `NOT IN` работает с `NULL`.
+
+## sql-where-having
+В чём разница между WHERE и HAVING и как работает GROUP BY?
+--- short
+`WHERE` фильтрует **строки до** группировки. `GROUP BY` сворачивает строки с одинаковыми значениями в группы, а агрегатные функции (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`) считают по одному значению на группу. `HAVING` фильтрует **группы после** агрегации, поэтому в нём можно использовать агрегаты (`HAVING COUNT(*) > 5`), а в `WHERE` — нельзя.
+--- details
+```sql
+SELECT customer_id, COUNT(*) AS orders, SUM(total) AS revenue
+FROM orders
+WHERE status = 'paid'            -- rows: only paid orders
+GROUP BY customer_id             -- one group per customer
+HAVING SUM(total) > 1000         -- groups: only big customers
+ORDER BY revenue DESC
+LIMIT 10;
+```
+
+Логический порядок выполнения (помогает объяснить ошибки): `FROM/JOIN` → `WHERE` → `GROUP BY` → `HAVING` → `SELECT` → `DISTINCT` → `ORDER BY` → `LIMIT`. Поэтому алиас из `SELECT` нельзя использовать в `WHERE` (его ещё нет), а в `ORDER BY` можно.
+
+Правила:
+- Каждая колонка в `SELECT` должна быть либо в `GROUP BY`, либо внутри агрегата (PostgreSQL разрешает другие колонки таблицы, сгруппированной по первичному ключу).
+- Фильтруй в `WHERE`, когда можно: это уменьшает число строк до дорогой группировки и позволяет использовать индексы.
+- `COUNT(*)` считает строки, `COUNT(column)` пропускает `NULL`, `COUNT(DISTINCT column)` считает уникальные непустые значения.
+
+## sql-keys
+Что такое первичные ключи, внешние ключи и ограничения?
+--- short
+**Первичный ключ** однозначно идентифицирует каждую строку: он `NOT NULL` и уникален, и для него автоматически создаётся индекс. **Внешний ключ** связывает колонку с первичным ключом другой таблицы, и база гарантирует, что строка, на которую ссылаются, существует (**ссылочная целостность**). Другие **ограничения**: `UNIQUE`, `NOT NULL`, `CHECK` (своё правило) и `EXCLUDE`. Ограничения держат данные корректными, даже если в коде приложения есть баги.
+--- details
+```sql
+CREATE TABLE users (
+  id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  email      TEXT NOT NULL UNIQUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE orders (
+  id       BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  user_id  BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  total    NUMERIC(12, 2) NOT NULL CHECK (total >= 0)
+);
+CREATE INDEX ON orders (user_id);  -- Postgres does NOT index foreign keys automatically
+```
+
+Что стоит упомянуть:
+- `ON DELETE CASCADE / SET NULL / RESTRICT` решает, что будет с дочерними строками.
+- PostgreSQL не создаёт индекс на колонке внешнего ключа. Добавь его, иначе соединения и удаления в родительской таблице будут медленными.
+- **Естественный или суррогатный ключ**: email может поменяться, поэтому сгенерированный ID обычно лучше как первичный ключ.
+- **UUID или BIGINT**: UUID можно генерировать где угодно, и он не раскрывает количество записей, но случайные UUID (v4) фрагментируют B-tree индексы. UUIDv7 (упорядоченный по времени) или BIGINT identity это решают.
+- Используй `GENERATED ... AS IDENTITY` (стандартный SQL), а не старый `SERIAL`.
+
+## sql-indexes
+Что такое индекс в базе данных, зачем он нужен и как работает?
+--- short
+Индекс — отдельная структура данных, которая позволяет найти строки **без просмотра всей таблицы**, как предметный указатель в конце книги. В PostgreSQL по умолчанию это **B-tree**: отсортированное сбалансированное дерево, поэтому поиск значения или диапазона занимает несколько чтений страниц вместо миллионов. Индексы ускоряют `WHERE`, `JOIN`, `ORDER BY` и проверки уникальности, но занимают место на диске и замедляют каждый `INSERT`, `UPDATE` и `DELETE`, потому что индекс тоже надо обновить.
+--- details
+```sql
+-- without an index: Seq Scan over millions of rows
+SELECT * FROM orders WHERE customer_id = 42;
+
+CREATE INDEX idx_orders_customer ON orders (customer_id);
+-- now: Index Scan, a few page reads
+```
+
+Когда индекс помогает:
+- Селективные фильтры (мало подходящих строк), соединения по внешним ключам, сортировка с `LIMIT` (top-N), ограничения уникальности.
+
+Когда не помогает или не используется:
+- Запрос возвращает большую часть таблицы: последовательный просмотр дешевле, и планировщик выбирает его.
+- К колонке применена функция: `WHERE lower(email) = '...'` не использует индекс по `email` (создай индекс по выражению `lower(email)`).
+- `LIKE '%text'` с подстановкой в начале не работает с B-tree (используй триграммный GIN-индекс).
+- Несовпадение типов или неявные приведения.
+
+Компромиссы: каждый лишний индекс замедляет запись и занимает место. Удаляй неиспользуемые индексы (`pg_stat_user_indexes` покажет `idx_scan = 0`). Всегда проверяй через `EXPLAIN ANALYZE`, что индекс реально используется.
+
+## sql-index-types
+Какие типы индексов есть в PostgreSQL и когда какой использовать?
+--- short
+**B-tree** (по умолчанию): равенство и диапазоны (`=`, `<`, `>`, `BETWEEN`, `ORDER BY`), покрывает большинство случаев. **Hash**: только равенство, редко лучше B-tree. **GIN**: для значений из многих элементов — `jsonb`, массивы, полнотекстовый поиск (`tsvector`), триграммный поиск через `pg_trgm`. **GiST**: геометрия, диапазоны, поиск ближайших соседей, тоже полнотекст. **BRIN**: крошечный индекс для огромных таблиц, где значения идут в физическом порядке, например время в журнале, куда только дописывают.
+--- details
+```sql
+CREATE INDEX ON users (email);                                  -- B-tree
+CREATE INDEX ON products USING gin (attributes jsonb_path_ops); -- jsonb @> queries
+CREATE INDEX ON articles USING gin (to_tsvector('russian', body)); -- full-text
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE INDEX ON users USING gin (name gin_trgm_ops);            -- ILIKE '%ann%'
+CREATE INDEX ON events USING brin (created_at);                 -- huge append-only table
+```
+
+B-tree или полнотекстовый индекс (частый вопрос): B-tree сравнивает значения целиком или по префиксу, поэтому отвечает на `email = 'a@b.c'` или `name LIKE 'Ann%'`, но не на «найди документы, где встречается слово *индекс*». Полнотекстовый GIN-индекс хранит каждое слово (лексему) со списком строк, где оно есть, — так он находит слова в любом месте текста, со стеммингом и ранжированием.
+
+Ещё полезно знать — не отдельные типы, а варианты: **составные**, **частичные** (`WHERE deleted_at IS NULL`), **по выражению** (`lower(email)`) и **покрывающие** (`INCLUDE`) индексы.
+
+## sql-composite-index
+Как работает составной индекс и используется ли он, если в запросе фильтр только по одной из его колонок?
+--- short
+Составной индекс по `(a, b, c)` отсортирован по `a`, внутри одинаковых `a` — по `b`, и так далее, как телефонный справочник по фамилии, потом по имени. Он эффективно работает для фильтров по **левым колонкам**: `a`, `a + b`, `a + b + c`. Фильтр только по `b` или `c` обычно не может нормально его использовать (PostgreSQL может просканировать весь индекс, но это намного менее эффективно). Поэтому порядок колонок важен: сначала колонки с равенством, потом диапазоны и сортировка.
+--- details
+```sql
+CREATE INDEX idx_orders_cust_date ON orders (customer_id, created_at DESC);
+
+-- ✅ uses the index: equality on the first column + order by the second
+SELECT * FROM orders WHERE customer_id = 42 ORDER BY created_at DESC LIMIT 20;
+
+-- ✅ first column only
+SELECT * FROM orders WHERE customer_id = 42;
+
+-- ❌ only the second column: the index is not helpful
+SELECT * FROM orders WHERE created_at > now() - interval '1 day';
+```
+
+Связанные приёмы:
+- **Частичный индекс**: индексировать только нужные строки: `CREATE INDEX ON orders (customer_id) WHERE status = 'pending';` Меньше и быстрее.
+- **Покрывающий индекс** с `INCLUDE`: `CREATE INDEX ON orders (customer_id) INCLUDE (total, status);` позволяет **index-only scan** ответить на запрос, не заходя в таблицу.
+- **Индекс по выражению**: `CREATE INDEX ON users (lower(email));` для поиска без учёта регистра.
+- Составной индекс по `(a, b)` обслуживает и запросы только по `a`, поэтому отдельный индекс по `a` обычно лишний.
+
+## sql-explain
+Как понять, почему запрос медленный, и как читать EXPLAIN ANALYZE?
+--- short
+`EXPLAIN` показывает план, который выбрал PostgreSQL; `EXPLAIN ANALYZE` реально выполняет запрос и показывает **настоящее время и число строк** на каждом шаге. Ищи: последовательные просмотры больших таблиц, большой разрыв между **ожидаемыми и реальными строками** (устаревшая статистика), вложенные циклы по множеству строк, сортировки и хеши, которые уходят на диск, и шаг, на котором тратится больше всего времени. Чтобы вообще найти медленные запросы, используй расширение `pg_stat_statements` и журнал медленных запросов.
+--- details
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT * FROM orders WHERE customer_id = 42 ORDER BY created_at DESC LIMIT 20;
+
+-- Limit  (actual time=0.05..0.09 rows=20)
+--   -> Index Scan using idx_orders_cust_date on orders (actual time=0.04..0.08 rows=20)
+--        Index Cond: (customer_id = 42)
+```
+
+Чек-лист диагностики:
+1. Найти запрос: `pg_stat_statements` с сортировкой по суммарному времени (частые средние запросы нередко важнее одного медленного).
+2. `EXPLAIN (ANALYZE, BUFFERS)` на реалистичных данных, а не на пустой базе разработки.
+3. Типичные исправления: добавить или поменять индекс (порядок колонок!), переписать запрос (без функций над индексированными колонками, без `SELECT *`, без пагинации через `OFFSET`), выполнить `ANALYZE` таблицы, если оценки неверные, убрать N+1 запросы в приложении.
+4. Проверить, что дело не в блокировках: `pg_stat_activity` показывает запросы, ждущие блокировку.
+5. Замерить снова после изменения.
+
+Типы просмотра, которые нужно узнавать: **Seq Scan** (вся таблица), **Index Scan** (индекс, затем таблица), **Index Only Scan** (только индекс), **Bitmap Heap Scan** (много строк по индексу). Соединения: **Nested Loop**, **Hash Join**, **Merge Join**.
+
+## sql-acid
+Что такое транзакция и что значит ACID?
+--- short
+**Транзакция** — группа операций, которую база рассматривает как одно целое: применяются либо все, либо ни одна. **ACID**: **Atomicity (атомарность)** — всё или ничего, сбой посередине откатывает всё. **Consistency (согласованность)** — данные переходят из одного корректного состояния в другое, все ограничения соблюдены. **Isolation (изоляция)** — параллельные транзакции не видят незавершённых изменений друг друга (в степени, заданной уровнем изоляции). **Durability (долговечность)** — после коммита данные переживут сбой (PostgreSQL сначала пишет их в журнал предзаписи).
+--- details
+```sql
+BEGIN;
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;
+UPDATE accounts SET balance = balance + 100 WHERE id = 2;
+COMMIT;   -- both changes become visible together; on error: ROLLBACK, nothing changes
+```
+
+Практические моменты для бэкенда:
+- Оборачивай бизнес-операцию, которая пишет несколько строк, в **одну** транзакцию: создание заказа с позициями, перевод денег, смена статуса вместе с записью в аудит.
+- Держи транзакции **короткими**: никаких HTTP-вызовов и медленной внешней работы внутри, потому что они держат блокировки и соединения.
+- С ORM следи, чтобы все запросы операции шли через один и тот же объект транзакции.
+- Если операция должна ещё и опубликовать событие или вызвать другой сервис, включить это в транзакцию базы нельзя. Используй **паттерн outbox**: запиши событие в таблицу в той же транзакции и опубликуй его потом.
+
+## sql-isolation
+Какие уровни изоляции транзакций поддерживает PostgreSQL и от каких аномалий они защищают?
+--- short
+Стандартных уровней четыре, но в PostgreSQL **Read Uncommitted** ведёт себя как Read Committed. **Read Committed** (по умолчанию): каждый оператор видит данные, закоммиченные до его начала, поэтому два чтения в одной транзакции могут увидеть разное. **Repeatable Read**: вся транзакция видит один снимок, поэтому повторные чтения стабильны. **Serializable**: транзакции ведут себя так, будто выполнялись по очереди; PostgreSQL может прервать одну с ошибкой сериализации, и приложение должно её **повторить**.
+--- details
+Аномалии, от простых к тонким:
+- **Грязное чтение (dirty read)**: видны незакоммиченные изменения другой транзакции. В PostgreSQL не бывает никогда.
+- **Неповторяющееся чтение (non-repeatable read)**: одна строка, прочитанная дважды, даёт разные значения. Возможно в Read Committed.
+- **Фантомное чтение (phantom read)**: повторный запрос возвращает новые строки. Возможно в Read Committed; в PostgreSQL его предотвращает Repeatable Read.
+- **Потерянное обновление / write skew**: две транзакции читают, принимают решение и пишут по устаревшим данным (например оба врача уходят с дежурства, потому что каждый видел другого на дежурстве). Write skew предотвращает только Serializable или явные блокировки.
+
+```sql
+BEGIN ISOLATION LEVEL SERIALIZABLE;
+-- ... reads and writes ...
+COMMIT;  -- may fail with SQLSTATE 40001 → retry the whole transaction
+```
+
+На практике большинство приложений работают на Read Committed и защищают критичные обновления **атомарными UPDATE** (`UPDATE ... SET balance = balance - 100 WHERE balance >= 100`), **блокировками строк** (`SELECT ... FOR UPDATE`), ограничениями уникальности или оптимистической блокировкой с колонкой версии. Serializable — для сложных инвариантов, с логикой повторов.
+
+## sql-mvcc-vacuum
+Что такое MVCC в PostgreSQL и зачем нужен VACUUM?
+--- short
+**MVCC** (multi-version concurrency control, многоверсионность) значит, что PostgreSQL никогда не перезаписывает строку на месте: `UPDATE` пишет **новую версию** строки, а старую помечает мёртвой, а `DELETE` просто помечает строку мёртвой. Каждая транзакция видит версии, подходящие её снимку, поэтому **читатели не блокируют писателей, а писатели — читателей**. Цена — накопление мёртвых версий строк. **VACUUM** их очищает, чтобы место можно было переиспользовать, а **autovacuum** делает это автоматически в фоне.
+--- details
+Почему это важно:
+- Без очистки таблицы и индексы **раздуваются** (bloat): таблица с миллионом живых строк может занимать место десяти миллионов, и запросы замедляются.
+- VACUUM ещё обновляет **visibility map** (нужна для index-only scan) и **замораживает** старые ID транзакций, предотвращая переполнение счётчика транзакций (wraparound), которое иначе заставило бы базу остановиться.
+- Обычный `VACUUM` не блокирует таблицу и делает место переиспользуемым. `VACUUM FULL` переписывает таблицу и возвращает место ОС, но берёт эксклюзивную блокировку, поэтому на нагруженных таблицах в продакшене его избегают (инструменты вроде `pg_repack` делают это онлайн).
+- `ANALYZE` (часто вместе с VACUUM) обновляет статистику для планировщика.
+
+Что мешает очистке: **долгие транзакции** (включая сессии, висящие в состоянии «idle in transaction») держат старые версии строк живыми для всех. Одна забытая открытая транзакция в приложении может раздуть всю базу.
+
+Настройка для таблиц с частыми обновлениями: понизить `autovacuum_vacuum_scale_factor` для таблицы и следить за мёртвыми строками в `pg_stat_user_tables`.
+
+## sql-locks
+Какие блокировки использует PostgreSQL, что такое дедлок и как обрабатывать конкурентные обновления?
+--- short
+PostgreSQL берёт **блокировки строк** для `UPDATE`, `DELETE` и `SELECT ... FOR UPDATE` и блокировки таблиц для DDL (`ALTER TABLE`) и некоторых служебных операций. **Дедлок** — когда транзакция A держит блокировку, нужную B, а B держит блокировку, нужную A. PostgreSQL обнаруживает это через `deadlock_timeout` и прерывает одну транзакцию с ошибкой, которую приложение должно повторить. Чтобы избежать дедлоков, блокируй строки в **одинаковом порядке** и держи транзакции короткими.
+--- details
+```sql
+-- pessimistic: lock the row while deciding
+BEGIN;
+SELECT balance FROM accounts WHERE id = 1 FOR UPDATE;   -- others wait here
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;
+COMMIT;
+
+-- job queue: each worker takes a different row, no waiting
+SELECT * FROM jobs WHERE status = 'new'
+ORDER BY id LIMIT 1
+FOR UPDATE SKIP LOCKED;
+```
+
+Работа с одними данными из нескольких экземпляров приложения (классический вопрос):
+- **Атомарный UPDATE** с условием внутри: `UPDATE stock SET qty = qty - 1 WHERE id = $1 AND qty > 0` — нет гонки «прочитал, потом записал».
+- **Пессимистическая блокировка**: `SELECT ... FOR UPDATE` внутри транзакции.
+- **Оптимистическая блокировка**: колонка `version`; `UPDATE ... SET version = version + 1 WHERE id = $1 AND version = $2`; ноль обновлённых строк значит, что кто-то изменил запись раньше — перечитать или вернуть 409.
+- **Ограничения уникальности** против дублей вместо «проверить, потом вставить».
+- **Advisory locks** (`pg_advisory_xact_lock`) для взаимного исключения на уровне приложения, например чтобы cron-задача выполнялась только на одном экземпляре.
+
+Пример дедлока: перевод A→B блокирует A, потом B, а перевод B→A — B, потом A. Решение: всегда блокировать счета в порядке возрастания ID.
+
+## sql-normalization
+Что такое нормализация и когда денормализуют?
+--- short
+**Нормализация** организует таблицы так, чтобы убрать дублирование и каждый факт хранился один раз: **1НФ** — атомарные значения, никаких списков в колонке; **2НФ** — каждая неключевая колонка зависит от всего ключа; **3НФ** — неключевые колонки не зависят от других неключевых. Это защищает от аномалий обновления (адрес клиента меняется в одном месте, а не в каждом заказе). **Денормализация** — намеренное дублирование данных ради скорости чтения, ценой поддержания копий в синхроне.
+--- details
+Пример: хранить `customer_name` и `customer_city` в каждой строке `orders` — это денормализация. Если город поменяется, придётся обновить много строк или получить противоречивые данные. Нормализовано: `orders.customer_id` → `customers(id, name, city)`.
+
+Когда денормализация оправдана:
+- Экраны с интенсивным чтением и дорогими соединениями или агрегатами: закешированный `orders_count` у `customers`, `total` у `orders`.
+- **Исторические снимки**: заказ должен хранить цену и адрес **на момент покупки**, даже если цена товара потом изменится. Это не дублирование, а другой факт.
+- Таблицы для отчётов и аналитики, поисковые индексы.
+
+Как держать копии корректными: обновлять их в той же транзакции, триггерами или **материализованными представлениями** с обновлением по расписанию. Сначала измерь: «медленный join» часто чинится индексами без денормализации.
+
+## sql-views
+Что такое представление (view) и чем оно отличается от материализованного представления?
+--- short
+**Представление** — сохранённый запрос с именем: оно не хранит данных, и при каждой выборке из него PostgreSQL выполняет исходный запрос. Используется, чтобы спрятать сложные соединения, дать стабильный интерфейс или ограничить, какие колонки видит роль. **Материализованное представление** хранит **результат** на диске как таблица, поэтому читается быстро, но данные — это снимок, который обновляют через `REFRESH MATERIALIZED VIEW`.
+--- details
+```sql
+CREATE VIEW active_users AS
+SELECT id, email, created_at FROM users WHERE deleted_at IS NULL;
+
+CREATE MATERIALIZED VIEW daily_revenue AS
+SELECT date_trunc('day', created_at) AS day, SUM(total) AS revenue
+FROM orders WHERE status = 'paid'
+GROUP BY 1;
+
+CREATE UNIQUE INDEX ON daily_revenue (day);
+REFRESH MATERIALIZED VIEW CONCURRENTLY daily_revenue;  -- doesn't block readers, needs a unique index
+```
+
+Когда что использовать:
+- **View**: упростить запросы, безопасность (показать только часть колонок или строк), обратная совместимость при перестройке таблиц. Сам по себе выигрыша в скорости не даёт.
+- **Материализованное**: дорогие агрегаты для дашбордов и отчётов, где допустимы слегка устаревшие данные. Обновлять по cron, после пакетной загрузки или по событиям.
+
+Ещё: простые представления бывают **обновляемыми** (через них можно делать `INSERT`/`UPDATE`), а `WITH CHECK OPTION` запрещает записывать строки, которые представление не показало бы.
+
+## sql-cte-window
+Что такое CTE и оконные функции?
+--- short
+**CTE** (`WITH name AS (...)`) — именованный подзапрос внутри одного запроса. Делает сложные запросы читаемыми по шагам, а `WITH RECURSIVE` умеет обходить деревья (категории, оргструктура, ветки комментариев). **Оконные функции** считают значение по набору связанных строк, **не сворачивая их**, как это делает `GROUP BY`: ранжирование (`ROW_NUMBER`, `RANK`), накопительные суммы, значение предыдущей строки (`LAG`), доля от общего.
+--- details
+```sql
+-- top 3 orders per customer
+WITH ranked AS (
+  SELECT o.*,
+         ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY total DESC) AS rn
+  FROM orders o
+)
+SELECT * FROM ranked WHERE rn <= 3;
+
+-- running total and change from the previous day
+SELECT day, revenue,
+       SUM(revenue) OVER (ORDER BY day) AS running_total,
+       revenue - LAG(revenue) OVER (ORDER BY day) AS diff
+FROM daily_revenue;
+
+-- category tree
+WITH RECURSIVE tree AS (
+  SELECT id, parent_id, name, 1 AS depth FROM categories WHERE parent_id IS NULL
+  UNION ALL
+  SELECT c.id, c.parent_id, c.name, t.depth + 1
+  FROM categories c JOIN tree t ON c.parent_id = t.id
+)
+SELECT * FROM tree;
+```
+
+Заметки: начиная с PostgreSQL 12, планировщик встраивает CTE в запрос (раньше они были «барьером оптимизации»; `MATERIALIZED` возвращает старое поведение). «Top N в каждой группе» через `ROW_NUMBER` — очень частая задача на собеседовании.
+
+## sql-jsonb
+В чём разница между JSON и JSONB в PostgreSQL и когда вообще хранить JSON?
+--- short
+`json` хранит текст как есть (с пробелами, порядком ключей и дублями ключей) и разбирает его при каждом чтении. `jsonb` хранит разобранную **бинарную** форму: чуть медленнее запись, намного быстрее запросы, поддержка **GIN-индексов** и операторов вроде `@>` (содержит), `?` (есть ключ) и `->>` (получить как текст). Почти всегда используй `jsonb`. Храни JSON для по-настоящему гибких или разреженных данных (настройки, данные от сторонних систем, атрибуты товаров), а не для данных, по которым постоянно соединяешь, фильтруешь или на которые нужны ограничения.
+--- details
+```sql
+CREATE TABLE products (
+  id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  name TEXT NOT NULL,
+  attributes JSONB NOT NULL DEFAULT '{}'
+);
+CREATE INDEX ON products USING gin (attributes jsonb_path_ops);
+
+SELECT name FROM products WHERE attributes @> '{"color": "red"}';
+SELECT attributes->>'size' AS size FROM products WHERE id = 1;
+UPDATE products SET attributes = jsonb_set(attributes, '{color}', '"blue"') WHERE id = 1;
+```
+
+Компромиссы:
+- Внутри JSON теряются внешние ключи, типы и проверки `NOT NULL` (добавь ограничения `CHECK` или валидируй в приложении).
+- Поля, по которым часто ищут, лучше сделать настоящими колонками (или генерируемыми колонками из JSON) с обычными индексами.
+- Обновление одного ключа переписывает всё значение, поэтому огромные часто обновляемые документы — плохой вариант.
+- Это прагматичный способ получить гибкость документной модели, не добавляя MongoDB в стек.
+
+## sql-orm
+Что такое ORM, какие у неё плюсы и минусы и что такое проблема N+1?
+--- short
+**ORM** (TypeORM, Prisma, Sequelize, MikroORM) сопоставляет таблицы базы с объектами или типами в коде, генерирует SQL, управляет связями и миграциями. Плюсы: меньше бойлерплейта, типобезопасность, проще рефакторинг, защита от SQL-инъекций. Минусы: скрытый или неэффективный SQL, сложнее писать сложные запросы и классическая **проблема N+1**: список загружается одним запросом, а связь каждого элемента — ещё N запросами.
+--- details
+```ts
+// ❌ N+1: 1 query for orders + 1 query per order for its customer
+const orders = await orderRepo.find();
+for (const o of orders) {
+  o.customer = await customerRepo.findOneBy({ id: o.customerId });
+}
+
+// ✅ one query with a join
+const orders = await orderRepo.find({ relations: { customer: true } });
+
+// ✅ or two queries: orders, then all customers WHERE id IN (...)
+```
+
+Как чинить N+1:
+- Загружать связи сразу через join (`relations`, `include` в Prisma) или пачкой через `WHERE id IN (...)`.
+- В GraphQL — **DataLoader**, который группирует и кеширует запросы в рамках одного запроса.
+- Включить логирование SQL в разработке и следить за числом запросов на один HTTP-запрос.
+
+Взгляд senior: ORM — для типичного CRUD, а query builder или чистый SQL (Kysely, Knex, `prisma.$queryRaw` с параметрами) — для сложных отчётов и запросов, где важна производительность. Для важных эндпоинтов всегда смотри сгенерированный SQL и прогоняй его через `EXPLAIN`. `save()` в TypeORM может сделать лишний `SELECT`, чтобы выбрать между вставкой и обновлением, а `insert()` всегда вставляет — это важно для массовых операций.
+
+## sql-pooling
+Зачем нужен пул соединений с PostgreSQL и как выбрать его размер?
+--- short
+Открывать соединение с PostgreSQL дорого: каждое — это отдельный **процесс** на сервере, занимающий несколько МБ памяти, и у сервера жёсткий лимит `max_connections` (часто 100). **Пул** держит несколько соединений открытыми и выдаёт их запросам, поэтому не нужно платить за установку соединения на каждый запрос и не превышается лимит. При многих экземплярах приложения добавляют внешний пулер вроде **PgBouncer**, потому что `экземпляры × размер пула` быстро растёт.
+--- details
+```ts
+import { Pool } from 'pg';
+const pool = new Pool({ max: 10, idleTimeoutMillis: 30_000, connectionTimeoutMillis: 2_000 });
+
+const { rows } = await pool.query('SELECT * FROM users WHERE id = $1', [id]);
+
+// transaction: take one client and always release it
+const client = await pool.connect();
+try {
+  await client.query('BEGIN');
+  // ...
+  await client.query('COMMIT');
+} catch (e) {
+  await client.query('ROLLBACK');
+  throw e;
+} finally {
+  client.release();   // forgetting this leaks connections until the pool is exhausted
+}
+```
+
+Размер: больше соединений — не значит быстрее. У базы ограничены ядра CPU и диск, и после какого-то порога соединения просто ждут друг друга. Начни с малого (около 10 на экземпляр) и проверь, что `max пула × число экземпляров` заметно меньше `max_connections`. Следи за временем ожидания соединения из пула.
+
+Симптомы проблем: запросы висят в ожидании соединения (пул исчерпан, часто из-за долгих транзакций или неосвобождённых клиентов), ошибки «too many connections» после увеличения числа реплик.
+
+PgBouncer в **transaction mode** позволяет тысячам клиентских соединений делить несколько серверных, но функции уровня сессии (`SET` на сессию, часть схем с подготовленными запросами, advisory locks между транзакциями) требуют аккуратности.
+
+## sql-pagination
+Как реализовать пагинацию и что не так с OFFSET?
+--- short
+`LIMIT 20 OFFSET 1000` прост и позволяет перейти на любую страницу, но база всё равно читает и выбрасывает пропущенные 1000 строк, поэтому дальние страницы всё медленнее, а при изменении данных между запросами строки сдвигаются (дубли или пропуски). **Keyset (курсорная) пагинация** запоминает последнее показанное значение и продолжает с него: `WHERE (created_at, id) < ($1, $2) ORDER BY created_at DESC, id DESC LIMIT 20`. С подходящим индексом каждая страница одинаково быстрая и стабильная.
+--- details
+```sql
+-- offset: page 500 reads 10 000 rows to return 20
+SELECT * FROM products ORDER BY id LIMIT 20 OFFSET 9980;
+
+-- keyset: continue after the last item of the previous page
+SELECT * FROM products
+WHERE (created_at, id) < ('2026-05-01 10:00', 123456)
+ORDER BY created_at DESC, id DESC
+LIMIT 20;
+-- index: (created_at DESC, id DESC)
+```
+
+Компромиссы:
+- **Offset**: номера страниц и «перейти на 37-ю», подходит для небольших таблиц и админок. Общее число через `COUNT(*)` дорого на больших таблицах (кешируй или показывай оценку).
+- **Keyset/курсор**: бесконечная прокрутка, ленты, API, большие таблицы. Нельзя прыгнуть на произвольную страницу. Ключ сортировки должен быть уникальным (добавь `id` для однозначности).
+- API обычно возвращают непрозрачный **курсор** (base64 последних значений) и `nextCursor`.
+- Для каталогов, важных для SEO, по-прежнему часто используют URL страниц с серверной пагинацией — главное, чтобы размер страницы был разумным, а запрос шёл по индексу.
+
+## sql-replication
+Что такое репликация, партиционирование и шардирование?
+--- short
+**Репликация** копирует данные с основного сервера на реплики. Потоковая репликация PostgreSQL передаёт журнал предзаписи на резервные серверы: они могут обслуживать **запросы на чтение** и заменить основной сервер при сбое. **Партиционирование** делит одну большую таблицу на физические части внутри той же базы (например по месяцам), чтобы запросы и обслуживание затрагивали только нужные части. **Шардирование** раскладывает данные по **разным серверам**, например по ID клиента, чтобы масштабировать запись за пределы одной машины.
+--- details
+Детали репликации:
+- **Асинхронная** (по умолчанию): быстрая, но реплика может отставать, поэтому чтение сразу после записи может вернуть старые данные (проблема «прочитать свою запись»). Критичные данные читай с основного сервера.
+- **Синхронная**: коммит ждёт подтверждения реплики, поэтому при переключении нет потери данных, но запись медленнее.
+- **Логическая репликация**: реплицирует выбранные таблицы, используется для миграций, обновлений и передачи данных в другие системы.
+- Переключение при сбое делают инструменты вроде Patroni или управляемые сервисы (RDS, Cloud SQL).
+
+Пример партиционирования:
+
+```sql
+CREATE TABLE events (id BIGINT, created_at TIMESTAMPTZ NOT NULL, payload JSONB)
+PARTITION BY RANGE (created_at);
+CREATE TABLE events_2026_11 PARTITION OF events
+  FOR VALUES FROM ('2026-11-01') TO ('2026-12-01');
+-- dropping old data = DROP TABLE events_2025_01 (instant, no huge DELETE)
+```
+
+Шардирование — большой шаг: соединения и транзакции между шардами становятся сложными. Прежде чем шардировать, попробуй индексы, кеширование, реплики на чтение, партиционирование и более мощный сервер. Расширения вроде Citus дают шардирование для PostgreSQL.
+
+## sql-money
+Как хранить деньги и баланс счёта в базе данных?
+--- short
+Никогда не используй типы с плавающей точкой (`FLOAT`, `REAL`, `DOUBLE`) для денег: `0.1 + 0.2` не равно ровно `0.3`. Используй `NUMERIC(точность, масштаб)` или храни целые числа в минимальных единицах (центы, копейки) как `BIGINT`, вместе с кодом валюты. Для балансов надёжная схема — **журнал проводок (ledger)**: таблица, куда только добавляются операции (списания и зачисления), а баланс — сумма записей, часто с кешированным балансом, который обновляется в той же транзакции.
+--- details
+```sql
+CREATE TABLE ledger_entries (
+  id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  account_id  BIGINT NOT NULL REFERENCES accounts(id),
+  amount      NUMERIC(14, 2) NOT NULL,          -- + credit, − debit
+  currency    CHAR(3) NOT NULL,
+  reason      TEXT NOT NULL,
+  idempotency_key TEXT UNIQUE,                   -- the same payment can't be applied twice
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- debit only if there is enough money, atomically
+UPDATE accounts SET balance = balance - 100
+WHERE id = 1 AND balance >= 100;               -- 0 rows updated → insufficient funds
+```
+
+Почему журнал проводок:
+- **Аудит**: всегда можно объяснить, как получился баланс, а ошибки исправляются компенсирующими записями, а не правкой истории.
+- Конкурентный доступ: вставка записи и обновление баланса — в одной транзакции, плюс атомарные условные обновления или блокировки строк, чтобы два параллельных платежа не ушли в минус.
+- Ключи идемпотентности защищают от двойного списания при повторе запроса клиентом.
+- Правила округления и конвертации валют — бизнес-решение: храни исходную сумму и валюту и округляй явно.
+
+## docker-container-vm
+Чем контейнер отличается от виртуальной машины?
+--- short
+**Виртуальная машина** эмулирует целый компьютер: поверх гипервизора она запускает собственное полноценное ядро ОС, поэтому она тяжёлая (гигабайты, загрузка — десятки секунд), но хорошо изолирована. **Контейнер** — это просто изолированный процесс на хосте: он **использует ядро хоста** и опирается на Linux namespaces (свой взгляд на процессы, сеть, файловую систему) и cgroups (ограничения CPU и памяти). Контейнеры лёгкие (мегабайты), запускаются за секунду, и их можно запускать много.
+--- details
+| | Виртуальная машина | Контейнер |
+|---|---|---|
+| Изоляция | полная ОС, своё ядро | на уровне процесса, общее ядро |
+| Размер | гигабайты | мегабайты |
+| Запуск | от секунд до минут | от миллисекунд до секунд |
+| Типичное применение | разные ОС, строгая изоляция между клиентами | одинаковая упаковка и запуск приложений |
+
+Почему контейнеры важны для разработчиков:
+- **«У меня работает» больше не проблема**: в образе лежат точная версия Node, системные библиотеки и код, и он везде запускается одинаково.
+- Простая локальная среда: `docker compose up` поднимает приложение, Postgres и Redis.
+- Это единица, которую раскладывает по серверам Kubernetes.
+
+Нюансы: на macOS и Windows Docker Desktop на самом деле запускает контейнеры внутри маленькой Linux-VM. Контейнеры изолированы слабее, чем VM (эксплойт ядра затрагивает хост), поэтому не запускай их от root и без необходимости не монтируй в них Docker-сокет.
+
+## docker-image-container
+Чем Docker-образ отличается от контейнера и что такое слои образа?
+--- short
+**Образ** — шаблон только для чтения: снимок файловой системы плюс метаданные (команда запуска, переменные окружения, открытые порты), собранный из Dockerfile. **Контейнер** — **запущенный экземпляр** образа со своим слоем для записи сверху. Из одного образа можно запустить много контейнеров. Образ состоит из **слоёв**: каждая инструкция Dockerfile вроде `RUN`, `COPY` или `ADD` создаёт слой, а слои кешируются и переиспользуются между образами.
+--- details
+```bash
+docker build -t my-api:1.4.0 .          # image
+docker run -d -p 3000:3000 my-api:1.4.0  # container from the image
+docker run -d -p 3001:3000 my-api:1.4.0  # a second container from the same image
+docker ps                                # running containers
+```
+
+Почему слои важны:
+- **Кеш сборки**: если слой и всё до него не изменились, Docker берёт его из кеша. Располагай инструкции от редко меняющихся к часто меняющимся (зависимости раньше исходников).
+- Скачивание быстрее: загружаются только недостающие слои.
+- Удаление файла в следующем слое не уменьшает образ (файл остаётся в предыдущем слое). Чисти в той же команде `RUN` или используй multi-stage сборку.
+
+Контейнеры **эфемерны**: всё, что записано в файловую систему контейнера, пропадает при его удалении. Постоянные данные хранят в **томах (volumes)** или во внешних сервисах (база, объектное хранилище). Помечай образы версиями или SHA коммита, а не только `latest`, чтобы точно знать, что задеплоено.
+
+## docker-dockerfile
+Как написать хороший Dockerfile для Node.js-приложения? Чем CMD отличается от ENTRYPOINT?
+--- short
+Хорошие практики: маленький официальный базовый образ (`node:22-alpine` или `-slim`) с зафиксированной версией; скопировать `package*.json` и выполнить `npm ci` **до** копирования исходников, чтобы слои с зависимостями кешировались; `.dockerignore` (исключить `node_modules`, `.git`, `.env`); запуск от **не-root** пользователя; `NODE_ENV=production`; exec-форма `CMD ["node", "dist/main.js"]`, чтобы сигналы доходили до Node. **ENTRYPOINT** задаёт исполняемый файл, который запускается всегда; **CMD** даёт аргументы по умолчанию (или команду по умолчанию), которые можно переопределить в `docker run`.
+--- details
+```dockerfile
+FROM node:22-alpine
+WORKDIR /app
+ENV NODE_ENV=production
+
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev               # cached unless dependencies change
+
+COPY dist ./dist
+USER node                           # don't run as root
+EXPOSE 3000
+CMD ["node", "dist/main.js"]        # exec form: node is PID 1 and receives SIGTERM
+```
+
+CMD и ENTRYPOINT:
+- `ENTRYPOINT ["node"]` + `CMD ["server.js"]` → `docker run img` запускает `node server.js`, а `docker run img worker.js` — `node worker.js`.
+- Shell-форма (`CMD node server.js`) запускается через `/bin/sh -c`, поэтому PID 1 — это shell, и он может не передать `SIGTERM`, что ломает graceful shutdown. Используй exec-форму (JSON-массив). У `npm start` похожая проблема.
+
+Ещё: добавь `HEALTHCHECK` или положись на пробы Kubernetes, никогда не зашивай секреты в образ (они остаются в его слоях) и сканируй образы на уязвимости (Trivy, Docker Scout).
+
+## docker-multistage
+Что такое multi-stage сборка и зачем она нужна?
+--- short
+В multi-stage Dockerfile несколько стадий `FROM`: в одной собираешь (с dev-зависимостями, компилятором TypeScript, инструментами сборки), а в маленькую финальную стадию копируешь **только результат** (скомпилированный код, продакшен-зависимости). Финальный образ намного меньше и не содержит компиляторов, исходников и dev-зависимостей, а это ещё и уменьшает поверхность атаки.
+--- details
+```dockerfile
+# 1. build stage
+FROM node:22-alpine AS build
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY . .
+RUN npm run build && npm prune --omit=dev
+
+# 2. runtime stage
+FROM node:22-alpine
+WORKDIR /app
+ENV NODE_ENV=production
+COPY --from=build /app/node_modules ./node_modules
+COPY --from=build /app/dist ./dist
+COPY package.json ./
+USER node
+CMD ["node", "dist/main.js"]
+```
+
+Типичный результат: образ уменьшается с ~1 ГБ (полный образ Node + dev-зависимости + исходники) до ~150–200 МБ. Для фронтенда финальной стадией может быть просто Nginx, раздающий статику, а для Next.js — папка из `output: 'standalone'`.
+
+Связанные советы: кеш-маунты BuildKit (`RUN --mount=type=cache,target=/root/.npm npm ci`) ускоряют сборки в CI; значения на этапе сборки передают через `ARG`, но никогда не секреты (для них `--secret`); distroless-образы (`gcr.io/distroless/nodejs`) ещё меньше.
+
+## docker-compose
+Что такое Docker Compose и что такое volumes и networks?
+--- short
+**Docker Compose** описывает набор контейнеров в одном `compose.yaml`: сервисы (приложение, Postgres, Redis), их образы или контекст сборки, переменные окружения, порты, тома и зависимости — и запускает всё командой `docker compose up`. Он нужен в основном для **локальной разработки и тестов**. **Volumes (тома)** хранят данные вне жизненного цикла контейнера (файлы базы переживают перезапуск). **Networks (сети)** связывают контейнеры, чтобы они обращались друг к другу **по имени сервиса** (`postgres:5432`).
+--- details
+```yaml
+services:
+  api:
+    build: .
+    ports: ["3000:3000"]
+    environment:
+      DATABASE_URL: postgres://app:secret@postgres:5432/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: secret
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app"]
+      interval: 5s
+volumes:
+  pgdata:
+```
+
+Что нужно знать:
+- Внутри сети приложение подключается к `postgres`, а не к `localhost`: `localhost` внутри контейнера — это сам контейнер.
+- **Именованными томами** управляет Docker; **bind mounts** (`./src:/app/src`) пробрасывают папку хоста, это удобно для hot reload в разработке.
+- `depends_on` только задаёт порядок запуска; добавь условие с **healthcheck**, чтобы ждать, пока база реально будет готова.
+- В продакшене обычно Kubernetes или управляемая платформа, а не Compose, хотя для небольших деплоев на один сервер Compose вполне подходит.
+
+## k8s-objects
+Какие основные объекты Kubernetes нужно знать разработчику?
+--- short
+**Pod**: минимальная единица, один или несколько контейнеров с общей сетью и хранилищем, обычно один контейнер приложения. **Deployment**: держит N одинаковых реплик подов и управляет rolling update и откатами. **Service**: стабильный внутренний адрес и балансировщик перед меняющимися подами. **Ingress** (или Gateway): маршрутизирует внешний HTTP-трафик к сервисам по хосту и пути. **ConfigMap** и **Secret**: конфигурация и чувствительные значения. **Namespace**: разделяет окружения или команды. Плюс **Job/CronJob** для разовых и периодических задач и **HorizontalPodAutoscaler** для масштабирования.
+--- details
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: api }
+spec:
+  replicas: 3
+  selector: { matchLabels: { app: api } }
+  template:
+    metadata: { labels: { app: api } }
+    spec:
+      containers:
+        - name: api
+          image: registry.example.com/api:1.4.0
+          ports: [{ containerPort: 3000 }]
+          envFrom: [{ configMapRef: { name: api-config } }, { secretRef: { name: api-secrets } }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: api }
+spec:
+  selector: { app: api }
+  ports: [{ port: 80, targetPort: 3000 }]
+```
+
+Ключевая идея — **желаемое состояние**: ты объявляешь «3 реплики образа X», а контроллеры Kubernetes постоянно приводят реальность к нему. Если под или нода упали, новый под создаётся в другом месте. Поды одноразовые и получают новые IP, поэтому к ним обращаются через Service (DNS-имя `api.namespace.svc`).
+
+Повседневные команды: `kubectl get pods`, `kubectl logs -f pod`, `kubectl describe pod` (события, почему не стартует), `kubectl exec -it pod -- sh`, `kubectl rollout status/undo deployment/api`.
+
+## k8s-deployment-statefulset
+Чем отличаются Deployment, StatefulSet и DaemonSet?
+--- short
+**Deployment** запускает **stateless**, взаимозаменяемые поды: любая реплика обработает любой запрос, у подов случайные имена, и их можно заменять в любом порядке. **StatefulSet** — для приложений **с состоянием** (базы, Kafka, Elasticsearch): у каждого пода стабильное имя (`db-0`, `db-1`), свой постоянный том, который за ним закреплён, и поды запускаются и останавливаются по порядку. **DaemonSet** запускает ровно один под на **каждой ноде** (сборщики логов, агенты мониторинга).
+--- details
+Когда что использовать:
+- Твой API на Node/NestJS, сервер Next.js, воркеры, читающие очередь → **Deployment**.
+- PostgreSQL, Redis с сохранением на диск, RabbitMQ в кластере → **StatefulSet** (хотя многие команды предпочитают управляемые базы вне Kubernetes или оператор вроде CloudNativePG).
+- Fluent Bit, node-exporter, агент безопасности → **DaemonSet**.
+- Разовые миграции или пакетные задачи → **Job**, задачи по расписанию → **CronJob**.
+
+Почему с состоянием сложнее: данные должны переживать перезапуск пода (PersistentVolumeClaims), реплики не одинаковые (основная и реплики), а масштабирование и обновление требуют аккуратности. Поэтому обычный совет — держать сервисы приложения stateless, а состояние выносить в базы, кеши и объектное хранилище.
+
+## k8s-requests-limits
+Что такое requests и limits ресурсов в Kubernetes?
+--- short
+**Requests** — то, что контейнеру **гарантировано**: планировщик ставит под только на ноду, где есть столько свободного CPU и памяти. **Limits** — **максимум**, который он может использовать. Если контейнер превышает **лимит памяти**, его убивают (**OOMKilled**) и перезапускают. Если он упирается в **лимит CPU**, его **троттлят** (замедляют), но не убивают.
+--- details
+```yaml
+resources:
+  requests:
+    cpu: "250m"       # a quarter of a core reserved
+    memory: "256Mi"
+  limits:
+    memory: "512Mi"   # above this → OOMKilled
+    # many teams skip CPU limits to avoid throttling latency spikes
+```
+
+Практические моменты для Node.js-сервиса:
+- Лимит кучи Node должен помещаться в лимит памяти: ставь `--max-old-space-size` примерно на 75% лимита контейнера (новые версии Node видят лимиты cgroup, но явная настройка предсказуемее).
+- Перезапуски с причиной `OOMKilled` в `kubectl describe pod` → утечка памяти или слишком низкий лимит.
+- Троттлинг CPU проявляется как всплески задержек, даже когда средняя загрузка CPU выглядит нормально.
+- Слишком большие requests впустую занимают ёмкость кластера; слишком маленькие — и поды вытесняют или их набивают на загруженные ноды.
+- **HorizontalPodAutoscaler** масштабирует по использованию CPU в процентах от **request**, поэтому requests влияют и на автомасштабирование.
+
+## k8s-probes
+Что такое liveness, readiness и startup пробы?
+--- short
+Пробы — проверки здоровья, которые Kubernetes выполняет для каждого контейнера. **Readiness**: «может ли под сейчас принимать трафик?» Если не проходит, под убирают из endpoints сервиса, но не перезапускают (например во время запуска или когда зависимость недоступна). **Liveness**: «не завис ли процесс?» Если проваливается несколько раз подряд, контейнер **перезапускают**. **Startup**: даёт медленно стартующим приложениям время до начала проверок liveness.
+--- details
+```yaml
+readinessProbe:
+  httpGet: { path: /health/ready, port: 3000 }
+  periodSeconds: 5
+livenessProbe:
+  httpGet: { path: /health/live, port: 3000 }
+  periodSeconds: 10
+  failureThreshold: 3
+startupProbe:
+  httpGet: { path: /health/live, port: 3000 }
+  failureThreshold: 30
+  periodSeconds: 2
+```
+
+Как проектировать эндпоинты (тут часто ошибаются):
+- **Liveness** должна проверять только сам процесс (event loop отвечает). Не проверяй базу в liveness: если база упадёт, Kubernetes будет по кругу перезапускать все поды, что базу не починит и только всё ухудшит.
+- **Readiness** может проверять критичные зависимости (соединение с базой, выполненные миграции, прогретые кеши).
+- При graceful shutdown сначала начни проваливать readiness, чтобы трафик перестал идти до закрытия сервера.
+- В NestJS `@nestjs/terminus` даёт готовые индикаторы здоровья для баз, памяти и диска.
+
+## k8s-rolling-update
+Как работает rolling update в Kubernetes и как деплоить без простоя?
+--- short
+Deployment обновляет поды **постепенно**: запускает новые поды с новым образом, ждёт, пока они станут **ready** (readiness-проба), потом удаляет старые. Этим управляют `maxSurge` (сколько лишних подов может быть) и `maxUnavailable` (сколько может быть недоступно). Если новые поды так и не становятся ready, раскатка останавливается, а старые поды продолжают обслуживать трафик. `kubectl rollout undo` откатывает на предыдущую версию.
+--- details
+```yaml
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxSurge: 1
+    maxUnavailable: 0     # never go below the desired replica count
+```
+
+Что на самом деле нужно для деплоя без простоя:
+- Правильная **readiness-проба**, иначе трафик пойдёт на неготовые поды.
+- **Graceful shutdown**: обработать `SIGTERM`, завершить текущие запросы и часто добавить короткий `preStop` sleep, чтобы балансировщик убрал под до того, как он перестанет принимать соединения.
+- **Обратно совместимые изменения**: во время раскатки старая и новая версии работают одновременно. Миграции базы должны работать для обеих (expand → migrate → contract), а API не должен ломать существующих клиентов.
+- Долгим соединениям (WebSocket) нужна логика переподключения на клиенте.
+
+Другие стратегии: **blue-green** (переключить весь трафик на полностью подготовленную новую версию), **canary** (сначала отправить небольшой процент трафика на новую версию, часто через Argo Rollouts или service mesh) и feature flags, чтобы отделить деплой от релиза.
+
+## k8s-config-secrets
+Как управлять конфигурацией и секретами в Kubernetes?
+--- short
+Несекретная конфигурация идёт в **ConfigMap**, чувствительные значения (пароли, API-ключи, токены) — в **Secret**, и оба передаются в поды как **переменные окружения** или **смонтированные файлы**. Один и тот же образ запускается во всех окружениях, отличается только конфигурация. Важно: Secrets в Kubernetes по умолчанию только **закодированы в base64**, а не зашифрованы, поэтому защищай их через RBAC, шифрование при хранении и лучше внешнее хранилище секретов.
+--- details
+```yaml
+apiVersion: v1
+kind: Secret
+metadata: { name: api-secrets }
+type: Opaque
+stringData:
+  DATABASE_URL: postgres://app:***@db:5432/app
+---
+# in the container spec
+envFrom:
+  - configMapRef: { name: api-config }
+  - secretRef: { name: api-secrets }
+```
+
+Хорошие практики:
+- Никогда не коммить настоящие секреты в git, даже в YAML для Kubernetes. Используй **External Secrets Operator** (синхронизирует из Vault, AWS Secrets Manager, GCP Secret Manager), **Sealed Secrets** или **SOPS** для зашифрованных файлов в git.
+- Переменные окружения читаются при запуске: изменение ConfigMap не обновляет работающие поды, поэтому запусти раскатку (`kubectl rollout restart`) или монтируй как файлы и перечитывай.
+- Ограничь через RBAC, кто может читать Secrets, и не выводи конфигурацию в логи при запуске.
+- Меняй учётные данные регулярно и предпочитай короткоживущие (например облачные IAM-роли для service accounts) статическим паролям.
+- Проверяй обязательную конфигурацию при запуске приложения, чтобы отсутствующая переменная валила деплой, а не запрос пользователя потом.
+
+## be-monolith-microservices
+Чем монолит отличается от микросервисов и как выбрать?
+--- short
+**Монолит** — одно приложение, которое деплоится целиком, с одной кодовой базой и обычно одной базой данных. В **микросервисной** архитектуре система разбита на небольшие сервисы: каждый отвечает за одну бизнес-область и владеет своими данными, деплоится независимо и общается с другими по сети (HTTP, gRPC, сообщения). Микросервисы дают независимый деплой и масштабирование и самостоятельность команд, но сильно добавляют сложности: сетевые сбои, распределённые данные, мониторинг, DevOps. Большинству продуктов стоит начинать с **модульного монолита** и выделять сервисы, только когда есть реальная причина.
+--- details
+| | Монолит | Микросервисы |
+|---|---|---|
+| Деплой | одно целое | каждый сервис отдельно |
+| Масштабирование | всё приложение | каждый сервис отдельно |
+| Данные | одна база, простые транзакции и join | база на сервис, итоговая согласованность |
+| Разработка | простой локальный запуск, лёгкий рефакторинг | много репозиториев или монорепа, контракты между сервисами |
+| Сбои | один баг может положить всё | частичные сбои, нужны повторы, таймауты, circuit breaker |
+| Команды | одна или несколько | много команд, у каждой своя область |
+
+Причины разделять: разные требования к масштабированию (тяжёлая обработка изображений), разная скорость релизов, много команд блокируют друг друга, часть системы с другими требованиями к надёжности или безопасности.
+
+Модульный монолит держит чёткие границы модулей (отдельные папки, без доступа к базе чужого модуля, публичные интерфейсы), поэтому разделить его потом проще. Признаки плохого разделения («распределённый монолит»): сервисы приходится деплоить вместе, длинные цепочки синхронных вызовов, общие базы.
+
+## be-message-broker
+Что такое брокер сообщений и когда нужна очередь вроде RabbitMQ или Kafka?
+--- short
+Брокер сообщений — посредник, который принимает сообщения от отправителей и доставляет их получателям **асинхронно**. Он развязывает сервисы (отправитель не ждёт получателя и даже не знает о нём), сглаживает всплески нагрузки (сообщения ждут в очереди) и позволяет повторять медленную или ненадёжную работу. **RabbitMQ** (и BullMQ на Redis) — классическая очередь задач с гибкой маршрутизацией. **Kafka** — распределённый надёжный **журнал** событий: высокая пропускная способность, сообщения хранятся и могут перечитываться многими группами получателей.
+--- details
+Типичные применения:
+- **Фоновые задачи**: отправка писем, генерация PDF и отчётов, обработка изображений — чтобы HTTP-запрос отвечал быстро.
+- **События между сервисами**: `order.created` → платежи, уведомления и аналитика реагируют независимо.
+- **Выравнивание нагрузки**: всплеск из 10 000 запросов превращается в очередь, которую воркеры разбирают в своём темпе.
+
+| | RabbitMQ | Kafka |
+|---|---|---|
+| Модель | очереди, сообщение удаляется после подтверждения | журнал только на дозапись, сообщения хранятся заданный срок |
+| Сильная сторона | маршрутизация, подтверждение каждого сообщения, очереди задач | огромная пропускная способность, перечитывание, потоки событий |
+| Порядок | в пределах очереди | в пределах партиции (по ключу) |
+
+Обязательные понятия: **доставка at-least-once** (сообщение может прийти дважды, поэтому получатели должны быть идемпотентными), **подтверждения (ack)** и повторы, **dead-letter очереди** для сообщений, которые постоянно падают, порядок только внутри очереди или партиции, и **паттерн outbox**, чтобы надёжно публиковать события вместе с записью в базу. В Kafka сообщения с одинаковым ключом попадают в одну партицию, поэтому их порядок сохраняется.
+
+## be-auth
+Чем аутентификация на сессиях отличается от JWT и как проверяется токен?
+--- short
+**Сессии**: после входа сервер создаёт сессию (хранит её в Redis или базе) и отдаёт браузеру случайный **ID сессии** в httpOnly-cookie. На каждый запрос сессия ищется в хранилище; выход или отзыв срабатывают сразу. **JWT**: сервер выдаёт **подписанный токен** с данными (ID пользователя, роли, срок действия). Любой сервис может проверить его по подписи **без похода в хранилище**, это хорошо масштабируется, но токен нельзя отозвать до истечения срока без отдельного списка отозванных, поэтому access-токены делают короткоживущими и дополняют refresh-токенами.
+--- details
+Как проверяется JWT:
+1. Разделить `header.payload.signature`, декодировать заголовок и данные (base64url — **не шифрование**, прочитать их может любой).
+2. Проверить, что алгоритм ожидаемый (никогда не принимать `alg: none`; не позволять токену выбирать алгоритм).
+3. Проверить **подпись** секретом (HS256) или публичным ключом издателя (RS256/ES256, берётся с JWKS-эндпоинта).
+4. Проверить поля: `exp` (не истёк), `nbf`, `iss` (ожидаемый издатель), `aud` (токен предназначен этому сервису).
+5. Только после этого доверять `sub` и ролям. Авторизация (что пользователю можно делать) — отдельная проверка.
+
+```ts
+const payload = await jwtVerify(token, JWKS, { issuer: 'https://auth.example.com', audience: 'api' });
+```
+
+Практический выбор:
+- Обычное веб-приложение с одним бэкендом или BFF → сессии в httpOnly-cookie просты и безопасны.
+- Много сервисов или сторонние клиенты → короткие JWT access-токены (5–15 минут) + ротируемые refresh-токены, которые хранятся на сервере.
+- Не клади чувствительные данные в payload JWT и по возможности не храни токены в `localStorage` (XSS может их прочитать).
+
+## be-caching
+Какие стратегии кеширования используют на бэкенде и чем Redis отличается от PostgreSQL?
+--- short
+Кешируют то, что часто читается и редко меняется или дорого вычисляется. Уровни: HTTP-кеширование и **CDN** для публичных ответов, **кеш в памяти** процесса для крошечных горячих данных и **Redis**, общий для всех экземпляров. Самый частый паттерн — **cache-aside**: читаем из кеша, при промахе читаем из базы и сохраняем с TTL. Самое сложное — **инвалидация**. **Redis** — хранилище «ключ-значение» в памяти: очень быстрое, с TTL и структурами данных (строки, хеши, множества, отсортированные множества, потоки), но ограничено объёмом RAM и слабее по надёжности хранения. **PostgreSQL** — надёжный источник истины с транзакциями, ограничениями и сложными запросами.
+--- details
+```ts
+async function getProduct(id: string) {
+  const key = `product:${id}`;
+  const cached = await redis.get(key);
+  if (cached) return JSON.parse(cached);
+
+  const product = await db.product.findUnique({ where: { id } });
+  await redis.set(key, JSON.stringify(product), 'EX', 300);   // 5 minutes
+  return product;
+}
+// on update: await redis.del(`product:${id}`)
+```
+
+Паттерны и проблемы, которые стоит назвать:
+- **Cache-aside** (ленивая загрузка), **write-through** (запись в кеш и базу вместе), **только TTL** для данных, которые могут быть чуть устаревшими.
+- **Cache stampede**: горячий ключ истекает, и тысячи запросов одновременно бьют в базу. Решения: блокировки или объединение запросов, обновление до истечения, случайный разброс TTL.
+- **Устаревшие данные**: удалять или обновлять ключ при записи, а TTL оставлять как страховку.
+- Redis ещё используют для сессий, rate limiting, распределённых блокировок, очередей (BullMQ), pub/sub и рейтингов (sorted sets).
+- Не используй Redis как единственную копию важных данных, если не настроены сохранение на диск (AOF) и репликация.
+
+## be-rate-limiting
+Как реализовать rate limiting в API?
+--- short
+Rate limiting ограничивает, сколько запросов клиент (по ID пользователя, API-ключу или IP) может сделать за промежуток времени, — для защиты от злоупотреблений, перебора паролей и перегрузки. Частые алгоритмы: **фиксированное окно** (простой счётчик на минуту), **скользящее окно** (ровнее), **token bucket** (разрешает короткие всплески при постоянной скорости пополнения). Если экземпляров приложения несколько, счётчики должны быть **общими**, обычно в Redis. Отвечать нужно `429 Too Many Requests` с заголовком `Retry-After`.
+--- details
+```ts
+// fixed window in Redis: 100 requests per minute per user
+async function allow(userId: string): Promise<boolean> {
+  const key = `rl:${userId}:${Math.floor(Date.now() / 60_000)}`;
+  const count = await redis.incr(key);
+  if (count === 1) await redis.expire(key, 60);
+  return count <= 100;
+}
+```
+
+В NestJS `@nestjs/throttler` даёт guard с хранилищем в Redis. Часто первая линия защиты — на входе: Nginx, API gateway, Cloudflare.
+
+Моменты проектирования:
+- Разные лимиты для разных эндпоинтов: строгие на вход и сброс пароля, мягче на чтение.
+- Фиксированное окно пропускает всплеск на границе окон (100 в 0:59 и 100 в 1:00). Скользящее окно и token bucket это исправляют.
+- Увеличение и проверка должны быть атомарными (Lua-скрипт или аккуратно `INCR` + `EXPIRE`), иначе параллельные запросы проскочат.
+- За прокси используй реальный IP клиента (`X-Forwarded-For` только от доверенного прокси).
+- Rate limiting — не то же самое, что **ограничение параллельности** и **backpressure** для дорогих операций.
+
+## be-idempotency
+Что такое идемпотентность и почему она важна для API и обработчиков сообщений?
+--- short
+Операция **идемпотентна**, если выполнить её несколько раз — то же самое, что выполнить один раз. Это важно, потому что сеть ненадёжна: клиент получает таймаут и повторяет запрос, очередь доставляет сообщение дважды. GET, PUT и DELETE идемпотентны по определению, POST — нет. Чтобы POST можно было безопасно повторять (платежи, заказы), клиент отправляет **Idempotency-Key**, а сервер сохраняет ключ вместе с результатом и на повторы возвращает сохранённый результат, не выполняя операцию снова.
+--- details
+```ts
+@Post('payments')
+async pay(@Headers('idempotency-key') key: string, @Body() dto: PayDto) {
+  const existing = await this.repo.findByKey(key);
+  if (existing) return existing.response;            // repeat → same answer, no second charge
+
+  const result = await this.payments.charge(dto);
+  await this.repo.save({ key, response: result });   // unique constraint on key
+  return result;
+}
+```
+
+Детали, о которых спрашивают:
+- Гонка: два одинаковых запроса приходят одновременно. **Ограничение уникальности** на ключ (или вставка ключа первым шагом со статусом «в обработке») гарантирует, что выиграет только один.
+- Ключи истекают через какое-то время (например через 24 часа).
+- **Получатели сообщений** при доставке at-least-once: храни таблицу обработанных ID сообщений или делай операцию идемпотентной по своей природе (`UPDATE ... SET status = 'paid' WHERE id = $1 AND status = 'pending'`).
+- Upsert (`INSERT ... ON CONFLICT DO UPDATE`) — простой способ сделать запись идемпотентной.
+- Классический пример из жизни — API Stripe.
+
+## be-distributed-tx
+Как сохранить согласованность данных между микросервисами: что такое паттерны Saga и Outbox?
+--- short
+У каждого микросервиса своя база, поэтому бизнес-операция, затрагивающая несколько сервисов, не может быть одной ACID-транзакцией (двухфазный коммит используют редко: он медленный и хрупкий). Вместо этого принимают **итоговую согласованность (eventual consistency)** и используют **Saga**: последовательность локальных транзакций, каждая публикует событие, запускающее следующий шаг, а если поздний шаг падает, **компенсирующие действия** отменяют предыдущие. Паттерн **Outbox** делает надёжным «обновить свою базу и опубликовать событие»: оба пишутся в одной локальной транзакции, а отдельный процесс публикует строки из outbox.
+--- details
+Пример саги (оформление заказа):
+1. Сервис заказов: создать заказ `PENDING` → событие `order.created`.
+2. Сервис платежей: списать деньги с карты → `payment.succeeded` или `payment.failed`.
+3. Сервис склада: зарезервировать товары → `stock.reserved` или `stock.failed`.
+4. Если склад не смог → компенсации: вернуть платёж, пометить заказ `CANCELLED`.
+
+Два стиля: **хореография** (сервисы реагируют на события друг друга, центрального координатора нет) и **оркестрация** (один оркестратор говорит каждому сервису, что делать; проще отслеживать и мониторить).
+
+Зачем нужен outbox: без него сервис может закоммитить изменения в базу и упасть до публикации события (или опубликовать и не закоммитить), и системы разойдутся.
+
+```sql
+BEGIN;
+INSERT INTO orders (...) VALUES (...);
+INSERT INTO outbox (topic, payload) VALUES ('order.created', '{...}');
+COMMIT;
+-- a relay (polling or CDC with Debezium) publishes outbox rows to Kafka/RabbitMQ, then marks them sent
+```
+
+Получатели должны быть **идемпотентными**, потому что ретранслятор может опубликовать одно событие дважды.
+
+## be-bff
+Что такое Backend-for-Frontend (BFF) и зачем он нужен?
+--- short
+BFF — слой бэкенда, сделанный **под один конкретный фронтенд** (веб-приложение, мобильное приложение). Он стоит между клиентом и нижележащими сервисами или CMS: собирает несколько вызовов в один ответ, превращает сырые данные ровно в ту форму, которая нужна интерфейсу, отвечает за аутентификацию и сессии и прячет внутренние API. Обычно им владеет фронтенд-команда. Он уменьшает число запросов с клиента, убирает маппинг бизнес-данных из UI-компонентов и позволяет бэкенд-сервисам меняться, не ломая интерфейс.
+--- details
+```
+Browser ──▶ Next.js / React
+              │
+              ▼
+           BFF (NestJS) ──▶ CMS API
+              │        ──▶ Users service
+              │        ──▶ Payments service
+              ▼
+     one typed response for the page
+```
+
+Что обычно делает BFF:
+- **Агрегация**: странице профиля нужны пользователь, заказы и рекомендации → один эндпоинт BFF параллельно вызывает три сервиса.
+- **Маппинг и валидация**: превращает форматы CMS или старых систем в типизированные DTO, поэтому изменение формата источника чинится в одном месте, а не в каждом компоненте.
+- **Безопасность**: держит токены на сервере (cookie сессии для браузера, сервисные токены для внутренних API), проверяет права, прячет внутренние эндпоинты.
+- **Кеширование** медленных данных из источников.
+
+Компромиссы: ещё один сервис, который надо деплоить и мониторить, и риск дублирования бизнес-логики, если BFF несколько и они разрастаются. Бизнес-правила место в доменных сервисах; BFF должен оставаться тонким слоем под конкретный интерфейс. В Next.js серверные компоненты и route handlers могут играть роль «облегчённого BFF».
+
+## be-api-contracts
+Как проектировать и развивать контракты API между фронтендом и бэкендом?
+--- short
+Договаривайтесь о контракте **до** реализации: эндпоинты, DTO запросов и ответов, формат ошибок, пагинация — в спецификации **OpenAPI** (или схеме GraphQL, или типах tRPC в TypeScript-монорепе). Генерируй из неё типы или клиент для фронтенда, чтобы ломающее изменение проявлялось как ошибка компиляции, а не баг в продакшене. Развивай API **обратно совместимо**: добавляй поля, но не удаляй и не переименовывай их; если сломать всё-таки нужно, выпусти новую версию и объяви старую устаревшей со сроками.
+--- details
+Практики:
+- **Contract-first**: спецификацию ревьюят обе стороны, и фронтенд работает против моков, сгенерированных из неё (MSW, Prism), пока бэкенд реализует.
+- **Code-first** тоже работает: NestJS + `@nestjs/swagger` генерирует OpenAPI из DTO, а `openapi-typescript` или `orval` генерируют клиент для фронтенда.
+- **Безопасные изменения**: добавление необязательного поля, новый эндпоинт, новое значение enum — только если клиенты умеют обрабатывать неизвестные значения. **Ломающие**: удаление или переименование полей, смена типов, превращение поля в обязательное, смена формата ошибок.
+- **Expand and contract**: добавить новое поле, перевести клиентов, потом удалить старое.
+- Версионирование: в URL (`/v2/`), в заголовке или пометка отдельных полей устаревшими. Сообщай об устаревании и следи, кто ещё пользуется старыми версиями.
+- Единый **формат ошибок** (код, сообщение, детали, ID запроса) и единые соглашения для дат (ISO 8601, UTC), ID и пагинации.
+- Контрактные тесты (Pact) или проверка схемы в CI ловят расхождения между сервисами.
+
+## be-observability
+Как сделать бэкенд-сервис наблюдаемым в продакшене?
+--- short
+Три сигнала. **Логи**: структурированный JSON (pino), с **ID запроса (correlation ID)** в каждой строке, без секретов и персональных данных. **Метрики**: частота запросов, доля ошибок, перцентили задержки (p95/p99), плюс специфичное для Node вроде задержки event loop и использования кучи; собирает Prometheus, показывает Grafana. **Трейсы**: распределённая трассировка через **OpenTelemetry** прослеживает один запрос через сервисы, базу и очереди и показывает, куда уходит время. Поверх этого — **алерты** на симптомы, которые чувствуют пользователи, а не на каждую мелочь.
+--- details
+```ts
+import pino from 'pino';
+const logger = pino({ level: 'info', redact: ['req.headers.authorization', 'password'] });
+
+app.use((req, res, next) => {
+  req.id = req.headers['x-request-id'] ?? crypto.randomUUID();
+  res.setHeader('x-request-id', req.id);
+  req.log = logger.child({ requestId: req.id });
+  next();
+});
+```
+
+Что настроить:
+- **RED-метрики** по каждому эндпоинту: Rate, Errors, Duration (частота, ошибки, длительность). Для ресурсов: загрузка и насыщение (CPU, память, занятость пула соединений, длина очереди).
+- **Трекинг ошибок** (Sentry) с релизами, чтобы видеть, какой деплой принёс ошибку.
+- **Correlation ID**, которые передаются дальше в вызовы других сервисов и сообщения очередей, чтобы логи разных сервисов можно было связать.
+- **Health-эндпоинты** для проб Kubernetes.
+- **SLO** (например 99,9% запросов быстрее 300 мс) и алерты, когда бюджет ошибок расходуется слишком быстро.
+- Уровни логов: `info` для бизнес-событий, `warn` для проблем, после которых сервис продолжает работать, `error` для сбоев; не логируй тело каждого запроса в продакшене.
