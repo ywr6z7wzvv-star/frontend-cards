@@ -47,7 +47,7 @@ On a public financial-literacy project, the SPA loaded server settings with one 
 <!-- основа: код рабочих проектов, привязка к проекту додумана -->
 On a government educational portal we had a real requirement to support old browsers: some users were on outdated school and office machines. The project was on Create React App with explicit polyfills: `whatwg-fetch`, `Element.closest`, smooth `scroll-behavior`, `classList` on SVG. I learned to check browserslist and analytics first and polyfill only what's actually used. Otherwise you ship extra kilobytes to everyone for a few percent of users.
 
-## js-promise-all-impl
+## code-promise-pool
 <!-- выдумано -->
 This came up in practice on the hockey platform: team managers uploaded a pack of documents, 20–30 scans per team, for review. Firing all uploads at once with `Promise.all` overloaded the server, and one failure rejected everything. I wrote a small concurrency-limited queue, three uploads at a time, with `allSettled` semantics, so the user saw which files failed and could retry only those.
 
@@ -210,7 +210,7 @@ On the J&J portal, all static assets, images included, were served by the Node c
 ## perf-long-lists
 I've solved this two ways. On the hockey platform, the catalog of 10,000+ players got server-side pagination, because people search and filter rather than scroll through everything, and it was better for SEO. In the planner, where one view showed a long list of employees, I used virtualization and rendered only the visible rows. The choice depends on whether users really need the whole list on screen.
 
-## perf-debounce-throttle
+## code-debounce
 In the hockey platform catalog, every keystroke in search fired a request, and responses could arrive out of order. I added a 300 ms debounce on the query and cancelled the previous request with `AbortController`; TanStack Query hands you the `signal` for that. Server load dropped and the flicker of stale results disappeared. Throttle I used for scroll handlers, like the sticky header.
 
 ## perf-caching

@@ -200,7 +200,11 @@ async function backfillStreaks() {
 // Topics that existed before topics could be switched off (used to find new ones).
 const ORIGINAL_CATS = ['js', 'css', 'react', 'vue', 'general', 'ts', 'perf', 'browser', 'security', 'architecture', 'testing', 'a11y', 'tooling', 'behavioral'];
 // Switched-off topics are left out of studying and tickets, but stay in the catalog and search.
-const isOn = cat => !S.settings.off.includes(cat);
+// "Search-only" topics (live coding) never go into study, tickets or progress:
+// they are found through search on the Interview tab and in the catalog.
+const isSearchOnly = cat => DATA.cats.some(c => c.id === cat && c.searchOnly);
+const topicCats = () => DATA.cats.filter(c => !c.searchOnly);
+const isOn = cat => !isSearchOnly(cat) && !S.settings.off.includes(cat);
 const onCats = () => DATA.cats.filter(c => isOn(c.id));
 const onQS = () => QS.filter(q => isOn(q.cat));
 function mergeState(s) {
@@ -505,6 +509,8 @@ const RU_TERMS = {
   'метрик': 'metric', 'трассир': 'trac', 'пул': 'pool', 'деньг': 'money', 'гард': 'guard', 'перехватчик': 'interceptor',
   'пайп': 'pipe', 'декоратор': 'decorator', 'модул': 'module', 'абстракт': 'abstract', 'кластер': 'cluster',
   'лимит': 'limit', 'ограничен': 'limit constraint', 'деплой': 'deploy', 'сага': 'saga', 'аутентиф': 'authentication',
+  'скобк': 'bracket', 'анаграм': 'anagram', 'купон': 'slip', 'ставк': 'bet', 'коэф': 'odds', 'экспресс': 'express',
+  'сжат': 'compress', 'группир': 'group', 'ретрай': 'retry', 'эмиттер': 'emitter', 'клонир': 'clone',
 };
 const RU_LAYOUT = 'йцукенгшщзхъфывапролджэячсмитьбю.ё';
 const EN_LAYOUT = "qwertyuiop[]asdfghjkl;'zxcvbnm,./`";
@@ -527,7 +533,7 @@ function buildIndex() {
     return {
       q,
       title: plain(q.q + ' ' + (ru.q || '')),
-      short: plain(q.s + ' ' + (ru.s || '')),
+      short: plain(q.s + ' ' + (ru.s || '') + (isSearchOnly(q.cat) ? ' live coding лайвкодинг задача' : '')),
       rest: plain(q.d + ' ' + (ru.d || '') + ' ' + (EXP[q.id] || '') + ' ' + (EXP_RU[q.id] || '')),
     };
   });
@@ -588,7 +594,7 @@ function metaRow(q) {
   return '<div class="card-meta"><span class="tag">' + esc(CAT_NAME[q.cat]) + '</span>' +
     (q.x ? '<span class="tag senior">Senior+</span>' : '') +
     (EXP[q.id] ? '<span class="tag has-exp" title="Есть история из опыта" aria-label="Есть история из опыта">💼</span>' : '') +
-    boxDots(q.id) + starBtn(q.id) + '</div>';
+    (isSearchOnly(q.cat) ? '' : boxDots(q.id)) + starBtn(q.id) + '</div>';
 }
 
 /* ---------- Views ---------- */
@@ -894,7 +900,7 @@ function renderInterviewResults() {
   const box = $('#iresults');
   if (!box) return;
   if (!iQuery.trim()) {
-    box.innerHTML = '<div class="empty ihint"><p>Набери слово из вопроса — по-английски, по-русски или в неправильной раскладке. Нажми на вопрос, чтобы раскрыть ответ прямо здесь.</p></div>';
+    box.innerHTML = '<div class="empty ihint"><p>Набери слово из вопроса — по-английски, по-русски или в неправильной раскладке. Нажми на вопрос, чтобы раскрыть ответ прямо здесь.</p><p>Задачи для лайвкодинга (debounce, Promise.all, скобки…) есть только здесь и в каталоге: набери «лайвкодинг» или название задачи.</p></div>';
     return;
   }
   const r = search(iQuery);
@@ -908,16 +914,16 @@ function renderInterviewResults() {
 function renderDetail(id) {
   const q = BY_ID[id];
   if (!q) { location.replace('#/catalog'); return; }
-  const c = card(id), st = status(id);
-  let info = STATUS_LABEL[st];
-  if (c) info += ' · повторений: ' + c.seen + ' · следующее: ' + (c.due <= Date.now() ? 'сейчас' : 'через ' + fmtInterval(c.due - Date.now()));
+  const c = card(id), st = status(id), coding = isSearchOnly(q.cat);
+  let info = coding ? 'Задача для лайвкодинга: её нет в «Учить» и билетах, она находится поиском и в каталоге.' : STATUS_LABEL[st];
+  if (c && !coding) info += ' · повторений: ' + c.seen + ' · следующее: ' + (c.due <= Date.now() ? 'сейчас' : 'через ' + fmtInterval(c.due - Date.now()));
   view.innerHTML = '<button class="back" data-act="back">‹ Назад</button>' +
     '<article class="card">' + metaRow(q) + '<h2 class="question">' + inline(T(q, 'q')) + '</h2>' +
     '<div class="short md"><div class="label">' + L('Short answer', 'Коротко') + '</div>' + md(T(q, 's')) + '</div>' +
     expBlock(q.id) +
     '<div class="details md">' + md(T(q, 'd')) + '</div>' +
     '<p class="count-line">' + esc(info) + '</p>' +
-    '<div class="detail-actions"><button class="btn primary" data-study="' + id + '">Учить эту карточку</button></div></article>';
+    (coding ? '' : '<div class="detail-actions"><button class="btn primary" data-study="' + id + '">Учить эту карточку</button></div>') + '</article>';
 }
 
 function renderProgress() {
@@ -968,6 +974,7 @@ function renderSettings() {
   const themes = [['auto', 'Авто'], ['dark', 'Тёмная'], ['light', 'Светлая']];
   const goals = [10, 20, 30, 50];
   const expCount = Object.keys(EXP).filter(id => BY_ID[id]).length;
+  const codingCount = QS.filter(q => isSearchOnly(q.cat)).length;
   const install = isStandalone() ? '' :
     '<div class="card install"><b>Установи как приложение</b><p>В Safari нажми <strong>Поделиться</strong> → <strong>На экран «Домой»</strong>. Приложение откроется без панели браузера и будет работать офлайн.</p></div>';
   view.innerHTML = install + '<div class="card">' +
@@ -977,7 +984,7 @@ function renderSettings() {
     '<div class="setting"><div class="l">Показывать истории из опыта<small>Блок «From my experience» под ответом</small></div><button class="switch" role="switch" data-toggle="exp" aria-checked="' + S.settings.exp + '" aria-label="Истории из опыта"></button></div>' +
     '</div>' +
     '<div class="section-title">Темы</div><div class="card"><p class="count-line">Выключенные темы не попадают в «Учить» и в билеты, но остаются в каталоге и поиске на «Собесе».</p>' +
-    DATA.cats.map(c => '<div class="setting"><div class="l">' + esc(c.name) + '<small>' + CAT_COUNT[c.id] + ' ' + plural(CAT_COUNT[c.id], 'вопрос', 'вопроса', 'вопросов') + '</small></div>' +
+    topicCats().map(c => '<div class="setting"><div class="l">' + esc(c.name) + '<small>' + CAT_COUNT[c.id] + ' ' + plural(CAT_COUNT[c.id], 'вопрос', 'вопроса', 'вопросов') + '</small></div>' +
       '<button class="switch" role="switch" data-topic="' + c.id + '" aria-checked="' + isOn(c.id) + '" aria-label="' + esc(c.name) + '"></button></div>').join('') + '</div>' +
     '<div class="section-title">Как это работает</div><div class="card md"><p>Каждая карточка живёт в одной из 5 «коробок». <strong>Знал</strong> переносит её выше, и она возвращается всё реже: через 15 минут, день, 3, 7 и 16 дней. <strong>Сомневался</strong> откладывает ненадолго. <strong>Не знал</strong> отправляет в начало, и карточка вернётся через минуту.</p><p>Режим <strong>Умный</strong> сначала даёт карточки, которые пора повторить, потом новые. <strong>Слабые</strong> гоняет вопросы, где ты хоть раз ответил «Не знал» или «Сомневался»; вопрос уходит оттуда только после 3 «Знал» подряд. Карточка считается выученной с 3-й коробки.</p></div>' +
     '<div class="section-title">Хранилище</div><div class="card"><p class="count-line">' +
@@ -990,7 +997,7 @@ function renderSettings() {
     '<p class="count-line">Бэкап на случай смены телефона. Код или файл можно загрузить на другом устройстве.</p>' +
     '<div class="detail-actions"><button class="btn" data-act="export">Показать код</button><button class="btn" data-act="file">Сохранить файлом</button><button class="btn" data-act="import">Вставить код</button></div><div id="io"></div></div>' +
     '<div class="section-title">Сброс</div><div class="card"><div class="detail-actions"><button class="btn danger" data-act="reset">Сбросить весь прогресс</button></div></div>' +
-    '<p class="count-line" style="text-align:center;margin-top:18px">' + QS.length + ' вопросов · ' + DATA.cats.length + ' тем · ' + expCount + ' ' + plural(expCount, 'история', 'истории', 'историй') + ' из опыта</p>' +
+    '<p class="count-line" style="text-align:center;margin-top:18px">' + (QS.length - codingCount) + ' ' + plural(QS.length - codingCount, 'вопрос', 'вопроса', 'вопросов') + ' · ' + codingCount + ' ' + plural(codingCount, 'задача', 'задачи', 'задач') + ' для лайвкодинга · ' + topicCats().length + ' тем · ' + expCount + ' ' + plural(expCount, 'история', 'истории', 'историй') + ' из опыта</p>' +
     '<p class="count-line diag">' + screenDiag() + '</p>';
 }
 
@@ -1307,7 +1314,7 @@ function catSheetHtml() {
     '<div class="sheet-actions"><button class="btn" data-preset="all">Все</button><button class="btn" data-preset="front">Фронтенд</button><button class="btn" data-preset="back">Бэкенд</button><button class="btn" data-preset="none">Снять все</button></div>' +
     '<button class="check" role="checkbox" data-only-exp aria-checked="' + S.settings.onlyExp + '"><span class="box">' + ICON_CHECK + '</span><span class="name">💼 Только вопросы с историей из опыта</span><span class="num">' + expCount + '</span></button>' +
     onCats().map(c => '<button class="check" role="checkbox" data-cat-toggle="' + c.id + '" aria-checked="' + sel.has(c.id) + '"><span class="box">' + ICON_CHECK + '</span><span class="name">' + esc(c.name) + '</span><span class="num">' + CAT_COUNT[c.id] + '</span></button>').join('') +
-    (onCats().length < DATA.cats.length ? '<p class="count-line">Остальные темы выключены в Настройках → «Темы».</p>' : '') +
+    (onCats().length < topicCats().length ? '<p class="count-line">Остальные темы выключены в Настройках → «Темы».</p>' : '') +
     '<div style="margin-top:14px"><button class="btn primary block" data-done>Готово</button></div>';
 }
 function openCats() {
@@ -1420,8 +1427,8 @@ document.addEventListener('click', async e => {
   if (d.topic) {
     const off = new Set(S.settings.off);
     off.has(d.topic) ? off.delete(d.topic) : off.add(d.topic);
-    if (off.size === DATA.cats.length) { toast('Хотя бы одна тема должна остаться'); return; }
-    S.settings.off = DATA.cats.map(c => c.id).filter(c => off.has(c));
+    if (off.size === topicCats().length) { toast('Хотя бы одна тема должна остаться'); return; }
+    S.settings.off = topicCats().map(c => c.id).filter(c => off.has(c));
     if (!off.has(d.topic) && !S.settings.cats.includes(d.topic)) S.settings.cats = [...S.settings.cats, d.topic];
     saveSettings(); TICKETS = buildTickets(); current = null;
     const y = window.scrollY; renderSettings(); window.scrollTo(0, y);
