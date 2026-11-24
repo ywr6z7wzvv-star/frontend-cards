@@ -35,6 +35,7 @@ function defaults() {
     favDel: {},     // question id -> time it was removed from favorites (for sync)
     resetAt: 0,     // time of the last "reset progress" (for sync)
     runTs: 0,       // time of the last change to the ticket in progress (for sync)
+    deal: null,     // which questions are in which ticket: { t: [[question id, ...], ...], ts }
     settings: { theme: 'auto', details: false, exp: true, onlyExp: false, goal: 20, mode: 'smart', cats: null, view: 'cards', lang: 'en', off: ['vue'], knownCats: null },
   };
 }
@@ -71,15 +72,15 @@ const idb = {
   async load() {
     const tx = this.db.transaction(['cards', 'kv', 'reviews'], 'readonly');
     const cs = tx.objectStore('cards'), kv = tx.objectStore('kv');
-    const [keys, vals, fav, days, settings, tickets, run, favDel, resetAt, runTs, count] = await Promise.all([
+    const [keys, vals, fav, days, settings, tickets, run, favDel, resetAt, runTs, deal, count] = await Promise.all([
       reqP(cs.getAllKeys()), reqP(cs.getAll()),
       reqP(kv.get('fav')), reqP(kv.get('days')), reqP(kv.get('settings')),
       reqP(kv.get('tickets')), reqP(kv.get('run')), reqP(kv.get('favDel')), reqP(kv.get('resetAt')), reqP(kv.get('runTs')),
-      reqP(tx.objectStore('reviews').count()),
+      reqP(kv.get('deal')), reqP(tx.objectStore('reviews').count()),
     ]);
     const cards = {};
     keys.forEach((k, i) => { cards[k] = vals[i]; });
-    return { cards, fav, days, settings, tickets, run, favDel, resetAt, runTs, reviewsCount: count, empty: !settings && !keys.length };
+    return { cards, fav, days, settings, tickets, run, favDel, resetAt, runTs, deal, reviewsCount: count, empty: !settings && !keys.length };
   },
   write(stores, fn) {
     const tx = this.db.transaction(stores, 'readwrite');
@@ -105,6 +106,7 @@ const idb = {
       kv.put(state.fav, 'fav'); kv.put(state.days, 'days'); kv.put(state.settings, 'settings');
       kv.put(state.tickets || {}, 'tickets'); kv.put(state.run || null, 'run');
       kv.put(state.favDel || {}, 'favDel'); kv.put(state.resetAt || 0, 'resetAt'); kv.put(state.runTs || 0, 'runTs');
+      kv.put(state.deal || null, 'deal');
       (reviews || []).forEach(r => rs.add(r));
     });
   },
@@ -115,7 +117,7 @@ const ls = {
   load() {
     const raw = localStorage.getItem(LEGACY_LS_KEY);
     const s = raw ? JSON.parse(raw) : {};
-    return { cards: s.cards || {}, fav: s.fav, days: s.days, settings: s.settings, tickets: s.tickets, run: s.run, favDel: s.favDel, resetAt: s.resetAt, runTs: s.runTs, reviewsCount: 0, empty: !raw };
+    return { cards: s.cards || {}, fav: s.fav, days: s.days, settings: s.settings, tickets: s.tickets, run: s.run, favDel: s.favDel, resetAt: s.resetAt, runTs: s.runTs, deal: s.deal, reviewsCount: 0, empty: !raw };
   },
   dump() { localStorage.setItem(LEGACY_LS_KEY, JSON.stringify(S)); return Promise.resolve(); },
   answer() { return this.dump(); },
@@ -218,10 +220,11 @@ function mergeState(s) {
   settings.cats = [...new Set([...cats, ...fresh])];
   settings.knownCats = allCats;
   settings.off = Array.isArray(settings.off) ? settings.off.filter(c => allCats.includes(c)) : ['vue'];
-  return { cards: s.cards || {}, fav: s.fav || {}, days: s.days || {}, tickets: s.tickets || {}, run: s.run || null, favDel: s.favDel || {}, resetAt: s.resetAt || 0, runTs: s.runTs || 0, settings };
+  return { cards: s.cards || {}, fav: s.fav || {}, days: s.days || {}, tickets: s.tickets || {}, run: s.run || null, favDel: s.favDel || {}, resetAt: s.resetAt || 0, runTs: s.runTs || 0, deal: validDeal(s.deal), settings };
 }
 const saveSettings = () => persist(backend.putKV('settings', S.settings));
 const saveFav = () => { touched(); return persist(Promise.all([backend.putKV('fav', S.fav), backend.putKV('favDel', S.favDel)])); };
+const saveDeal = () => persist(backend.putKV('deal', S.deal));
 const saveTickets = () => { touched(); return persist(backend.putKV('tickets', S.tickets)); };
 const saveRun = () => {
   S.runTs = Date.now();
@@ -667,34 +670,90 @@ function nextCard() {
 }
 
 /* ---------- Tickets ----------
-   Questions are dealt into ~20-question tickets like a deck of cards, round-robin
-   through every topic, so each ticket gets a fair share of each topic. The deal is
-   deterministic: ticket 7 is always the same set while questions.json doesn't change.
+   Questions are dealt into ~20-question tickets. The deal is stored (and synced),
+   so changes to the question set touch only the tickets they concern:
+   - a question removed from questions.json simply disappears from its ticket;
+   - a new question goes to the smallest ticket (a new ticket opens when all are full);
+   - switching a topic off only hides its questions, the deal itself doesn't change.
+   The stored deal covers every question of every topic; TICKETS is what's visible now.
+   A ticket result counts only while the ticket has exactly the questions it was
+   passed with (`sig`), so a changed ticket starts fresh and the others keep theirs.
    A ticket is passed only when every answer is "Знал". */
 const TICKET_SIZE = 20;
-let TICKETS = [];           // [[question id, ...], ...]; ticket number = index + 1
-let DEAL = '';              // fingerprint of the current deal of questions into tickets
+let TICKETS = [];           // visible deal: [[question id, ...], ...]; ticket number = index + 1
 let ticketListOpen = false; // show the list even though a ticket is in progress
 function hash(str) {
   let h = 2166136261;
   for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); }
   return h >>> 0;
 }
-function buildTickets() {
-  const qs = onQS();
+const sigOf = ids => hash(ids.slice().sort().join(',')).toString(36);
+function validDeal(d) { return d && Array.isArray(d.t) && d.t.length && d.t.every(Array.isArray) ? d : null; }
+
+// Before the deal was stored, it was recomputed from scratch on every start, round-robin
+// through the topics. These questions were dealt that way and later moved to live coding;
+// they are needed once more to rebuild that last deal exactly.
+const LEGACY_REMOVED = { 'js-promise-all-impl': 'js', 'js-event-emitter': 'js', 'js-currying': 'js', 'perf-debounce-throttle': 'perf' };
+function legacyDeal(withRemoved) {
+  const qs = onQS().map(q => ({ id: q.id, cat: q.cat }));
+  if (withRemoved) Object.entries(LEGACY_REMOVED).forEach(([id, cat]) => { if (isOn(cat)) qs.push({ id, cat }); });
   const n = Math.max(1, Math.round(qs.length / TICKET_SIZE));
   const out = Array.from({ length: n }, () => []);
   let k = 0;
   onCats().forEach(c => qs.filter(q => q.cat === c.id).sort((a, b) => hash(a.id) - hash(b.id)).forEach(q => out[k++ % n].push(q.id)));
-  const tickets = out.map((ids, i) => ids.sort((a, b) => hash(a + '#' + i) - hash(b + '#' + i))); // mix topics inside a ticket
-  DEAL = hash(tickets.map(t => t.join(',')).join('|')).toString(36);
-  return tickets;
+  const tickets = out.map((ids, i) => ids.sort((a, b) => hash(a + '#' + i) - hash(b + '#' + i)));
+  return { tickets, fp: hash(tickets.map(t => t.join(',')).join('|')).toString(36) };
 }
-// Ticket results count only for the current deal: new questions or topic switches reshuffle tickets.
-function statsFor(key) { const t = S.tickets[key]; return t && t.deal === DEAL ? t : null; }
+// Results saved by older versions carry the old deal's fingerprint instead of `sig`.
+function migrateResults() {
+  const old = Object.entries(S.tickets).filter(([, t]) => t && !t.sig);
+  if (!old.length) return false;
+  const decks = [legacyDeal(true), legacyDeal(false)];
+  old.forEach(([key, t]) => {
+    const d = decks.find(x => x.fp === t.deal);
+    t.sig = d && d.tickets[key - 1] ? sigOf(d.tickets[key - 1]) : 'none';
+  });
+  return true;
+}
+// Make sure the stored deal exists and contains every question.
+function ensureDeal() {
+  let changed = false;
+  if (!S.deal) {
+    // First start with a stored deal: take over the deal the results were made with.
+    const used = new Set(Object.values(S.tickets).map(t => t && t.deal));
+    const a = legacyDeal(true), b = legacyDeal(false);
+    S.deal = { t: (used.has(a.fp) || !used.has(b.fp) ? a : b).tickets, ts: 0 };   // ts 0: a synced deal wins
+    changed = true;
+  }
+  const inDeal = new Set(S.deal.t.flat());
+  const missing = QS.filter(q => !isSearchOnly(q.cat) && !inDeal.has(q.id)).map(q => q.id).sort((a, b) => hash(a) - hash(b));
+  if (missing.length) {
+    const t = S.deal.t.map(x => x.slice());
+    for (const id of missing) {
+      let i = 0;
+      t.forEach((x, j) => { if (x.length < t[i].length) i = j; });
+      if (t[i].length >= TICKET_SIZE + 5) { t.push([]); i = t.length - 1; }
+      t[i].push(id);
+    }
+    S.deal = { t, ts: Date.now() };
+    changed = true;
+  }
+  if (changed) saveDeal();
+  if (migrateResults()) saveTickets();
+  return changed;
+}
+// Visible tickets: questions that still exist and whose topic is on, in a mixed order.
+function buildTickets() {
+  ensureDeal();
+  return S.deal.t.map((ids, i) => ids.filter(id => BY_ID[id] && isOn(BY_ID[id].cat)).sort((a, b) => hash(a + '#' + i) - hash(b + '#' + i)));
+}
+function statsFor(key) {
+  const t = S.tickets[key], ids = TICKETS[key - 1];
+  return t && ids && t.sig === sigOf(ids) ? t : null;
+}
 function runIsCurrent(run) {
   const ids = typeof run.key === 'number' && TICKETS[run.key - 1];
-  return !!ids && ids.join() === run.ids.join();
+  return !!ids && sigOf(ids) === sigOf(run.ids);
 }
 function runLabel(run) { return run.key === 'errors' ? 'Работа над ошибками' : runIsCurrent(run) ? 'Билет ' + run.key : 'Прошлый билет'; }
 // Questions answered wrong in the latest attempt of any ticket.
@@ -758,7 +817,7 @@ function finishTicket() {
     size: run.ids.length,
     passed: prev.passed || ok === run.ids.length,
     ts: Date.now(),
-    deal: DEAL,
+    sig: sigOf(run.ids),
     mistakes: run.ids.filter((id, i) => run.answers[i] !== 2),
   };
   saveTickets();
@@ -1004,7 +1063,7 @@ function renderSettings() {
 /* ---------- Backup ---------- */
 async function backupJson() {
   const reviews = await backend.reviews().catch(() => []);
-  return JSON.stringify({ v: 2, exported: new Date().toISOString(), cards: S.cards, fav: S.fav, favDel: S.favDel, days: S.days, tickets: S.tickets, reviews });
+  return JSON.stringify({ v: 2, exported: new Date().toISOString(), cards: S.cards, fav: S.fav, favDel: S.favDel, days: S.days, tickets: S.tickets, deal: S.deal, reviews });
 }
 const toB64 = s => btoa(unescape(encodeURIComponent(s)));
 const fromB64 = s => decodeURIComponent(escape(atob(s)));
@@ -1014,10 +1073,12 @@ async function applyBackup(text) {
   if (!obj || typeof obj !== 'object' || !obj.cards) throw new Error('bad backup');
   S.cards = obj.cards || {}; S.fav = obj.fav || {}; S.days = obj.days || {};
   S.tickets = obj.tickets || {}; S.run = null; S.favDel = obj.favDel || {};
+  if (validDeal(obj.deal)) S.deal = obj.deal;
   const reviews = Array.isArray(obj.reviews) ? obj.reviews : [];
   await backend.replace(S, reviews);
   reviewsCount = reviews.length;
   await backfillStreaks();
+  TICKETS = buildTickets();
   touched();
 }
 
@@ -1084,7 +1145,7 @@ function normalizeSnapshot(x) {
   x = x || {};
   return {
     resetAt: x.resetAt || 0,
-    run: x.run || null, runTs: x.runTs || 0,
+    run: x.run || null, runTs: x.runTs || 0, deal: validDeal(x.deal),
     reviews: Array.isArray(x.reviews) ? x.reviews.filter(r => Array.isArray(r) && r.length >= 3) : [],
     fav: x.fav || {}, favDel: x.favDel || {},
     tickets: x.tickets || {}, legacy: x.legacy || {}, days: x.days || {},
@@ -1097,7 +1158,7 @@ async function localSnapshot() {
   const inLog = new Set(reviews.map(r => r[0]));
   const legacy = {};
   Object.entries(S.cards).forEach(([id, c]) => { if (!inLog.has(id)) legacy[id] = c; });   // progress older than the log
-  return normalizeSnapshot({ resetAt: S.resetAt, run: S.run, runTs: S.runTs, reviews, fav: { ...S.fav }, favDel: { ...S.favDel }, tickets: S.tickets, legacy, days: { ...S.days } });
+  return normalizeSnapshot({ resetAt: S.resetAt, run: S.run, runTs: S.runTs, deal: S.deal, reviews, fav: { ...S.fav }, favDel: { ...S.favDel }, tickets: S.tickets, legacy, days: { ...S.days } });
 }
 
 function mergeSnapshots(a, b) {
@@ -1151,7 +1212,10 @@ function mergeSnapshots(a, b) {
   const runTs = Math.max(a.runTs, b.runTs);
   const run = runTs > resetAt ? runSrc.run : null;
 
-  return { resetAt, reviews, fav, favDel, tickets, legacy, days, run, runTs };
+  // The deal: the last stored one wins (a deal is never "reset").
+  const deal = !a.deal ? b.deal : !b.deal ? a.deal : (b.deal.ts > a.deal.ts ? b.deal : a.deal);
+
+  return { resetAt, reviews, fav, favDel, tickets, legacy, days, run, runTs, deal };
 }
 
 // Card states for a snapshot: legacy cards plus a replay of the review log.
@@ -1166,7 +1230,7 @@ function replaySnapshot(m) {
   }
   return { cards, rows };
 }
-const snapshotKey = m => JSON.stringify([m.resetAt, m.reviews, m.fav, m.favDel, m.tickets, m.legacy, m.days, m.run, m.runTs]);
+const snapshotKey = m => JSON.stringify([m.resetAt, m.reviews, m.fav, m.favDel, m.tickets, m.legacy, m.days, m.run, m.runTs, m.deal]);
 
 async function syncNow({ silent = false } = {}) {
   if (!syncCfg || !syncCfg.token) return false;
@@ -1193,6 +1257,8 @@ async function syncNow({ silent = false } = {}) {
         S.cards = cards; S.fav = merged.fav; S.favDel = merged.favDel; S.tickets = merged.tickets;
         S.days = merged.days; S.resetAt = merged.resetAt;
         S.run = merged.run; S.runTs = merged.runTs;
+        if (merged.deal) S.deal = merged.deal;
+        TICKETS = buildTickets();
         await backend.replace(S, rows);
         reviewsCount = rows.length;
       }
@@ -1492,7 +1558,7 @@ document.addEventListener('click', async e => {
   if (d.act === 'reset') {
     confirmSheet('Сбросить прогресс?', 'Все уровни карточек, избранное, журнал ответов и статистика удалятся' + (syncCfg && syncCfg.token ? ', в том числе на других синхронизированных устройствах' : '') + '. Это нельзя отменить.', 'Сбросить', async () => {
       const now = Date.now();
-      S = { ...defaults(), settings: S.settings, resetAt: now, runTs: now };
+      S = { ...defaults(), settings: S.settings, deal: S.deal, resetAt: now, runTs: now };
       await persist(backend.replace(S, []));
       reviewsCount = 0;
       touched();
@@ -1535,7 +1601,6 @@ async function loadData() {
   EXP = eRes ? parseExperience(await eRes.text()) : {};
   RU = ruRes ? parseRuQuestions(await ruRes.text()) : {};
   EXP_RU = eRuRes ? parseExperience(await eRuRes.text()) : {};
-  TICKETS = buildTickets();
   const unknown = Object.keys(EXP).filter(id => !BY_ID[id]);
   if (unknown.length) console.warn('experience.md: unknown question ids', unknown);
 }
